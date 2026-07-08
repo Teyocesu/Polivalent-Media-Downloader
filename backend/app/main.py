@@ -15,6 +15,7 @@ from .cleanup import cleanup_loop
 from .config import get_settings
 from .downloader import DownloadTooLarge, fetch_metadata
 from .jobs import JobGone, JobManager, JobNotReady
+from .rate_limit import FixedWindowRateLimiter
 from .security import create_token, verify_password, verify_token
 from .utils import UserFacingError, validate_media_url
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 job_manager = JobManager(settings)
+login_rate_limiter = FixedWindowRateLimiter(max_failures=8, window_seconds=300)
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -80,6 +82,16 @@ if settings.allowed_origins:
     )
 
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
 @app.exception_handler(UserFacingError)
 async def handle_user_error(_request: Request, exc: UserFacingError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
@@ -97,9 +109,17 @@ async def health():
 
 
 @app.post("/api/auth/login", response_model=LoginResponse)
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
+    limiter_key = _client_key(request)
+    if login_rate_limiter.is_limited(limiter_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiados intentos. Espera unos minutos y proba de nuevo.",
+        )
     if not verify_password(body.password, settings):
+        login_rate_limiter.record_failure(limiter_key)
         raise HTTPException(status_code=401, detail="Contrasena incorrecta.")
+    login_rate_limiter.reset(limiter_key)
     return {"ok": True, "token": create_token(settings)}
 
 
@@ -117,6 +137,7 @@ async def info(body: UrlRequest):
 @app.post("/api/download", dependencies=[Depends(require_auth)])
 async def download(body: DownloadRequest):
     validated = validate_media_url(body.url, settings)
+    await asyncio.to_thread(fetch_metadata, validated.url, settings)
     job = job_manager.create_job(validated.url, body.quality, validated.site)
     return {"jobId": job.job_id, "status": "queued"}
 
@@ -172,3 +193,7 @@ async def serve_spa(full_path: str):
         status_code=404,
         detail="Frontend no compilado. Ejecuta npm run build y copia frontend/dist a backend/static.",
     )
+
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"

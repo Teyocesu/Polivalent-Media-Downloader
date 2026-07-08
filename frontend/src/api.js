@@ -1,5 +1,13 @@
 const API_BASE = "";
 
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export async function login(password) {
   return request("/api/auth/login", {
     method: "POST",
@@ -44,7 +52,7 @@ export async function downloadFile(jobId, token) {
   });
 
   if (!response.ok) {
-    throw new Error(await readError(response));
+    throw new ApiError(await readError(response), response.status);
   }
 
   const disposition = response.headers.get("content-disposition") || "";
@@ -64,7 +72,7 @@ async function request(path, { method, body, token }) {
   });
 
   if (!response.ok) {
-    throw new Error(await readError(response));
+    throw new ApiError(await readError(response), response.status);
   }
 
   return response.json();

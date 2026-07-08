@@ -21,6 +21,7 @@ Copiá `.env.example` a `.env` y ajustá:
 
 ```bash
 APP_PASSWORD=cambia-esta-contrasena
+APP_SECRET_KEY=cambia-esta-clave-para-firmar-tokens
 MAX_FILE_MB=500
 DOWNLOAD_TTL_MINUTES=15
 DOWNLOAD_TIMEOUT_SECONDS=600
@@ -29,7 +30,7 @@ PORT=8000
 ENVIRONMENT=development
 ```
 
-En produccion, `APP_PASSWORD` es obligatoria. En Render tambien conviene usar `ENVIRONMENT=production`.
+En produccion, `APP_PASSWORD` es obligatoria. `APP_SECRET_KEY` es opcional, pero recomendado para firmar tokens con una clave distinta de la contrasena. En Render tambien conviene usar `ENVIRONMENT=production`.
 
 ## Correr local con Docker
 
@@ -98,6 +99,7 @@ Vite proxya `/api` y `/health` al backend local.
 
 ```text
 APP_PASSWORD=una-contrasena-larga
+APP_SECRET_KEY=otra-clave-larga
 MAX_FILE_MB=500
 DOWNLOAD_TTL_MINUTES=15
 DOWNLOAD_TIMEOUT_SECONDS=600
@@ -124,6 +126,34 @@ pip install -U yt-dlp
 ```
 
 En Render, hacé un nuevo deploy para que la imagen instale la version disponible de `yt-dlp`.
+
+## QA local
+
+Backend:
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+cd ..
+pytest -q
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+Docker, si Docker Desktop esta corriendo:
+
+```bash
+docker compose build
+docker compose up
+```
 
 ## Descargas temporales de unico uso
 

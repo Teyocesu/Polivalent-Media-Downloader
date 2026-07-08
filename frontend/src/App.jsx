@@ -56,8 +56,7 @@ export default function App() {
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err.message);
-          setViewState("error");
+          handleApiError(err);
         }
       }
     };
@@ -99,8 +98,7 @@ export default function App() {
       setQuality(info.availableQualities?.[0] || "best");
       setViewState("ready");
     } catch (err) {
-      setError(err.message);
-      setViewState("error");
+      handleApiError(err);
     }
   }
 
@@ -114,8 +112,7 @@ export default function App() {
       setJobId(result.jobId);
       setJob({ jobId: result.jobId, status: result.status, progress: 0, message: "En cola..." });
     } catch (err) {
-      setError(err.message);
-      setViewState("error");
+      handleApiError(err);
     }
   }
 
@@ -144,7 +141,7 @@ export default function App() {
           : current,
       );
     } catch (err) {
-      setError(err.message);
+      handleApiError(err, null);
     } finally {
       setIsSaving(false);
     }
@@ -179,6 +176,25 @@ export default function App() {
     setError("");
   }
 
+  function handleApiError(err, fallbackState = "error") {
+    if (err?.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      setToken("");
+      setViewState("loggedOut");
+      setMetadata(null);
+      setJob(null);
+      setJobId("");
+      setNotice("");
+      setError("Sesion expirada. Volve a entrar.");
+      return;
+    }
+
+    setError(err?.message || "No se pudo completar la accion.");
+    if (fallbackState) {
+      setViewState(fallbackState);
+    }
+  }
+
   if (!token || viewState === "loggedOut") {
     return (
       <main className="app-shell auth-shell">
@@ -189,16 +205,24 @@ export default function App() {
           <h1 id="login-title">Media Downloader</h1>
           <p className="muted">App privada para guardar contenido publico permitido.</p>
           <form className="stack" onSubmit={handleLogin}>
+            <input
+              type="hidden"
+              name="username"
+              autoComplete="username"
+              value="private-user"
+              readOnly
+            />
             <label htmlFor="password">Contrasena</label>
             <input
               id="password"
+              name="password"
               autoComplete="current-password"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               placeholder="Tu APP_PASSWORD"
             />
-            <button className="primary-button" type="submit">
+            <button className="primary-button" type="submit" disabled={!password.trim()}>
               Entrar
             </button>
           </form>
