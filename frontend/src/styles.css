@@ -162,6 +162,13 @@ h2 {
   gap: 10px;
 }
 
+.quality-hint,
+.progress-message {
+  margin: 0;
+  color: #aeb8bf;
+  font-size: 0.9rem;
+}
+
 .download-form {
   margin-bottom: 14px;
 }
@@ -280,6 +287,43 @@ h2 {
   border-radius: inherit;
   background: #55d6a3;
   transition: width 180ms ease;
+}
+
+.progress-bar.is-indeterminate {
+  min-width: 18%;
+  background: linear-gradient(90deg, #55d6a3, #9deacb, #55d6a3);
+  background-size: 180% 100%;
+  animation: pulse-progress 1.2s linear infinite;
+}
+
+.download-stats {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 10px;
+  margin: 0;
+  color: #dce4e8;
+  font-size: 0.9rem;
+}
+
+.download-stats dt {
+  color: #86939c;
+  font-weight: 800;
+}
+
+.download-stats dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@keyframes pulse-progress {
+  from {
+    background-position: 0 0;
+  }
+
+  to {
+    background-position: 180% 0;
+  }
 }
 
 .error-text,

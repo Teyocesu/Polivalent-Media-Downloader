@@ -8,7 +8,9 @@ Usala solo con contenido propio, publico o que tengas permiso de guardar. No int
 
 - Login con `APP_PASSWORD`.
 - Analisis de metadata sin descargar archivos.
+- Limpieza automatica de URLs de YouTube con parametros de playlist/radio/share cuando contienen un video individual.
 - Selector de calidad: mejor compatible, 1080p, 720p, 480p o MP3.
+- Progreso detallado con fase, velocidad, ETA y bytes cuando `yt-dlp` los reporta.
 - Descarga en una carpeta temporal unica bajo `/tmp/media-downloads`.
 - Entrega el archivo como attachment.
 - Borra el archivo y la carpeta temporal despues de entregarlo.
@@ -55,7 +57,7 @@ ipconfig getifaddr en0
 
 ## Correr local sin Docker
 
-Necesitás Python 3.12+, Node 20+ y ffmpeg instalado.
+Necesitás Python 3.12+, Node 20+ y ffmpeg instalado. Node tambien ayuda a `yt-dlp-ejs` para compatibilidad con YouTube.
 
 ```bash
 cp .env.example .env
@@ -108,6 +110,8 @@ ENVIRONMENT=production
 
 Render define `PORT` automaticamente. El backend escucha en `0.0.0.0` y usa esa variable.
 
+La imagen Docker instala `ffmpeg`, `ffprobe`, `nodejs`, `yt-dlp[default,curl-cffi]` y `yt-dlp-ejs` en runtime. No usa cookies ni login.
+
 ## Actualizar yt-dlp
 
 Con Docker, reconstruí la imagen:
@@ -126,6 +130,21 @@ pip install -U yt-dlp
 ```
 
 En Render, hacé un nuevo deploy para que la imagen instale la version disponible de `yt-dlp`.
+
+Si YouTube cambia algo y empieza a fallar, forzá un redeploy o un deploy manual desde Render para reconstruir la imagen e instalar una version nueva de `yt-dlp`. La app no usa cookies del usuario, navegador logueado ni credenciales de plataformas.
+
+## Debug seguro
+
+`GET /api/debug/system` devuelve informacion de runtime sin secretos:
+
+- version de `yt-dlp`
+- disponibilidad de `ffmpeg` y `ffprobe`
+- disponibilidad de Node/Deno para `yt-dlp-ejs`
+- carpeta temporal
+- limites de tamano y timeout
+- entorno
+
+En produccion requiere `Authorization: Bearer <token>`.
 
 ## QA local
 

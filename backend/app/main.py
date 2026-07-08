@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -10,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from yt_dlp.version import __version__ as ytdlp_version
 
 from .cleanup import cleanup_loop
 from .config import get_settings
@@ -54,11 +56,17 @@ def require_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bear
         raise HTTPException(status_code=401, detail="Sesion expirada o invalida.")
 
 
+def require_debug_auth(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
+    if not settings.is_production and credentials is None:
+        return
+    require_auth(credentials)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(job_manager.cleanup_expired)
     cleanup_task = asyncio.create_task(cleanup_loop(job_manager))
-    logger.info("Media downloader started")
+    logger.info("Media downloader started system=%s", _system_debug_payload())
     try:
         yield
     finally:
@@ -131,14 +139,20 @@ async def info(body: UrlRequest):
     except DownloadTooLarge:
         raise
     metadata["site"] = metadata.get("site") or validated.site
+    metadata["normalizedUrl"] = validated.url
+    metadata["wasNormalized"] = validated.was_normalized
     return metadata
 
 
 @app.post("/api/download", dependencies=[Depends(require_auth)])
 async def download(body: DownloadRequest):
     validated = validate_media_url(body.url, settings)
-    await asyncio.to_thread(fetch_metadata, validated.url, settings)
-    job = job_manager.create_job(validated.url, body.quality, validated.site)
+    job = job_manager.create_job(
+        validated.url,
+        body.quality,
+        validated.site,
+        original_url=validated.original_url,
+    )
     return {"jobId": job.job_id, "status": "queued"}
 
 
@@ -176,6 +190,11 @@ async def cancel_job(job_id: str):
     return {"ok": True, "status": "expired"}
 
 
+@app.get("/api/debug/system", dependencies=[Depends(require_debug_auth)])
+async def debug_system():
+    return _system_debug_payload()
+
+
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
@@ -197,3 +216,17 @@ async def serve_spa(full_path: str):
 
 def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+def _system_debug_payload() -> dict:
+    return {
+        "ytDlpVersion": ytdlp_version,
+        "ffmpegAvailable": shutil.which("ffmpeg") is not None,
+        "ffprobeAvailable": shutil.which("ffprobe") is not None,
+        "nodeAvailable": shutil.which("node") is not None or shutil.which("nodejs") is not None,
+        "denoAvailable": shutil.which("deno") is not None,
+        "tempDir": str(settings.download_base_dir),
+        "maxFileMb": settings.max_file_mb,
+        "downloadTimeoutSeconds": settings.download_timeout_seconds,
+        "environment": settings.environment,
+    }

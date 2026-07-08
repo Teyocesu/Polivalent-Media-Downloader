@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

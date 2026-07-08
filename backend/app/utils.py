@@ -18,10 +18,13 @@ class ValidatedUrl:
     url: str
     site: str
     hostname: str
+    original_url: str
+    was_normalized: bool = False
 
 
 def validate_media_url(raw_url: str, settings: Settings) -> ValidatedUrl:
-    url = raw_url.strip()
+    original_url = raw_url.strip()
+    url = original_url
     if not url:
         raise UserFacingError("Pegá un link para continuar.")
 
@@ -37,8 +40,24 @@ def validate_media_url(raw_url: str, settings: Settings) -> ValidatedUrl:
     if hostname not in settings.allowed_domains:
         raise UserFacingError("Ese dominio no esta permitido para esta app.")
 
-    _reject_playlist(parsed.path, parsed.query, hostname)
-    return ValidatedUrl(url=url, site=detect_site(hostname), hostname=hostname)
+    normalized_url = normalize_url(url)
+    normalized_hostname = urlparse(normalized_url).hostname or hostname
+    return ValidatedUrl(
+        url=normalized_url,
+        site=detect_site(normalized_hostname),
+        hostname=normalized_hostname,
+        original_url=original_url,
+        was_normalized=normalized_url != original_url,
+    )
+
+
+def normalize_url(raw_url: str) -> str:
+    url = raw_url.strip()
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if hostname in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
+        return _normalize_youtube_url(parsed, hostname)
+    return url
 
 
 def detect_site(hostname: str) -> str:
@@ -67,10 +86,37 @@ def safe_remove_tree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _reject_playlist(path: str, query: str, hostname: str) -> None:
-    params = parse_qs(query, keep_blank_values=True)
-    is_youtube = hostname in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
-    if is_youtube and ("list" in params or path.rstrip("/") == "/playlist"):
-        raise UserFacingError("Las playlists estan desactivadas en esta version.")
+def _normalize_youtube_url(parsed, hostname: str) -> str:
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    path = parsed.path.rstrip("/")
+
+    if hostname == "youtu.be":
+        video_id = _clean_youtube_id(parsed.path.lstrip("/").split("/")[0])
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+        raise UserFacingError("No se pudo detectar el video de YouTube.")
+
+    if path == "/playlist" or (not params.get("v") and "list" in params):
+        raise UserFacingError("Esta URL es una playlist. Pegá el link de un video individual.")
+
+    if path == "/watch":
+        video_id = _clean_youtube_id((params.get("v") or [""])[0])
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+        raise UserFacingError("No se pudo detectar el video de YouTube.")
+
+    if path.startswith("/shorts/"):
+        video_id = _clean_youtube_id(path.split("/", 3)[2] if len(path.split("/")) > 2 else "")
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+        raise UserFacingError("No se pudo detectar el short de YouTube.")
+
     if "/playlist" in path.lower():
-        raise UserFacingError("Las playlists estan desactivadas en esta version.")
+        raise UserFacingError("Esta URL es una playlist. Pegá el link de un video individual.")
+
+    return parsed.geturl()
+
+
+def _clean_youtube_id(value: str) -> str:
+    match = re.match(r"^[A-Za-z0-9_-]{6,}$", value.strip())
+    return match.group(0) if match else ""

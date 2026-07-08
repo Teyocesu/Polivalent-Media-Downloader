@@ -110,8 +110,15 @@ def test_info_validates_urls_and_returns_mocked_metadata(client, token, monkeypa
         json={"url": "https://www.youtube.com/watch?v=abc123&list=PL123"},
         headers=auth_headers(token),
     )
-    assert playlist.status_code == 400
-    assert "playlists" in playlist.json()["detail"].lower()
+    assert playlist.status_code == 200
+
+    pure_playlist = client.post(
+        "/api/info",
+        json={"url": "https://www.youtube.com/playlist?list=PL123"},
+        headers=auth_headers(token),
+    )
+    assert pure_playlist.status_code == 400
+    assert "playlist" in pure_playlist.json()["detail"].lower()
 
 
 def test_info_reports_platform_failure_without_stack_trace(client, token, monkeypatch):
@@ -145,28 +152,45 @@ def test_download_invalid_quality_and_missing_token_are_rejected(client, token):
 
 
 def test_download_reuses_metadata_validation_before_queueing(client, token, monkeypatch):
-    def metadata_failure(url, settings):
+    def download_failure(url, quality, temp_dir, settings, progress_callback, check_cancelled):
         raise UserFacingError("Los vivos o streams no estan soportados en esta version.")
 
-    monkeypatch.setattr(main_module, "fetch_metadata", metadata_failure)
+    monkeypatch.setattr(jobs_module, "fetch_metadata", lambda url, settings: {"title": "ok"})
+    monkeypatch.setattr(jobs_module, "download_media", download_failure)
     response = client.post(
         "/api/download",
         json={"url": "https://youtu.be/dQw4w9WgXcQ", "quality": "best"},
         headers=auth_headers(token),
     )
-    assert response.status_code == 400
-    assert "streams" in response.json()["detail"]
+    assert response.status_code == 200
+    status = wait_for_job(client, token, response.json()["jobId"], {"error"})
+    assert "streams" in status["message"]
 
 
 def test_download_file_is_one_use_and_temp_dir_is_removed(client, token, monkeypatch):
     monkeypatch.setattr(
-        main_module,
+        jobs_module,
         "fetch_metadata",
         lambda url, settings: {"title": "ok", "availableQualities": ["best"]},
     )
 
     def fake_download_media(url, quality, temp_dir, settings, progress_callback, check_cancelled):
-        progress_callback(25, "Descargando...", "downloading")
+        progress_callback(
+            {
+                "status": "downloading",
+                "phase": "downloading_video",
+                "phaseLabel": "Descargando video",
+                "progress": 42,
+                "downloadPercent": 57.3,
+                "speed": "2.4 MB/s",
+                "eta": "00:18",
+                "downloadedBytes": 12345678,
+                "totalBytes": 98765432,
+                "message": "Descargando video...",
+                "step": 4,
+                "stepsTotal": 5,
+            }
+        )
         output = temp_dir / "clip.mp4"
         output.write_bytes(b"video-bytes")
         return output, "clip.mp4"
@@ -182,6 +206,7 @@ def test_download_file_is_one_use_and_temp_dir_is_removed(client, token, monkeyp
     job_id = created.json()["jobId"]
     done = wait_for_job(client, token, job_id, {"done"})
     assert done["progress"] == 100
+    assert done["phase"] == "done"
     assert done["filename"] == "clip.mp4"
 
     job_dir = main_module.job_manager._jobs[job_id].temp_dir
@@ -197,14 +222,21 @@ def test_download_file_is_one_use_and_temp_dir_is_removed(client, token, monkeyp
 
 def test_delete_job_cancels_and_removes_temp_dir(client, token, monkeypatch):
     monkeypatch.setattr(
-        main_module,
+        jobs_module,
         "fetch_metadata",
         lambda url, settings: {"title": "ok", "availableQualities": ["720"]},
     )
 
     def slow_download_media(url, quality, temp_dir, settings, progress_callback, check_cancelled):
         (temp_dir / "partial.part").write_bytes(b"partial")
-        progress_callback(10, "Descargando...", "downloading")
+        progress_callback(
+            {
+                "status": "downloading",
+                "phase": "downloading_video",
+                "progress": 10,
+                "message": "Descargando video...",
+            }
+        )
         while not check_cancelled():
             time.sleep(0.01)
         raise DownloadCancelled()
@@ -228,7 +260,7 @@ def test_delete_job_cancels_and_removes_temp_dir(client, token, monkeypatch):
 
 def test_download_timeout_becomes_safe_error(client, token, monkeypatch):
     monkeypatch.setattr(
-        main_module,
+        jobs_module,
         "fetch_metadata",
         lambda url, settings: {"title": "ok", "availableQualities": ["best"]},
     )
@@ -244,4 +276,17 @@ def test_download_timeout_becomes_safe_error(client, token, monkeypatch):
     )
     assert created.status_code == 200
     status = wait_for_job(client, token, created.json()["jobId"], {"error"})
-    assert "tiempo maximo" in status["message"]
+    assert "tardó demasiado" in status["message"]
+
+
+def test_debug_system_requires_no_secret_and_reports_runtime(client):
+    response = client.get("/api/debug/system")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "ytDlpVersion" in payload
+    assert "ffmpegAvailable" in payload
+    assert "ffprobeAvailable" in payload
+    assert "nodeAvailable" in payload
+    assert "denoAvailable" in payload
+    assert "APP_PASSWORD" not in response.text
+    assert "test-password" not in response.text

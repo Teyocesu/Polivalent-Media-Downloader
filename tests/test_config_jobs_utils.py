@@ -3,10 +3,17 @@ import time
 import pytest
 
 from backend.app.config import Settings, get_settings
-from backend.app.downloader import DownloadTooLarge, _download_options, _ensure_size_allowed
+from yt_dlp.utils import DownloadError
+
+from backend.app.downloader import (
+    DownloadTooLarge,
+    _download_options,
+    _ensure_size_allowed,
+    _map_ytdlp_error,
+)
 from backend.app.jobs import DownloadJob, JobManager
 from backend.app.security import create_token, verify_token
-from backend.app.utils import UserFacingError, sanitize_filename, validate_media_url
+from backend.app.utils import UserFacingError, normalize_url, sanitize_filename, validate_media_url
 
 
 def make_settings(tmp_path, max_file_mb=1, ttl_minutes=1):
@@ -66,6 +73,13 @@ def test_url_validation_domains_playlists_and_credentials(tmp_path):
     settings = make_settings(tmp_path)
     assert validate_media_url("https://x.com/user/status/123", settings).site == "X / Twitter"
     assert validate_media_url("https://www.instagram.com/reel/demo/", settings).site == "Instagram"
+    assert (
+        validate_media_url(
+            "https://www.youtube.com/watch?v=m4Be0hRQGIs&list=RDm4Be0hRQGIs&start_radio=1",
+            settings,
+        ).url
+        == "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    )
 
     with pytest.raises(UserFacingError):
         validate_media_url("ftp://youtube.com/watch?v=abc", settings)
@@ -73,6 +87,24 @@ def test_url_validation_domains_playlists_and_credentials(tmp_path):
         validate_media_url("https://user:pass@youtube.com/watch?v=abc", settings)
     with pytest.raises(UserFacingError):
         validate_media_url("https://www.youtube.com/playlist?list=PL123", settings)
+
+
+def test_normalize_youtube_url_variants(tmp_path):
+    assert (
+        normalize_url("https://www.youtube.com/watch?v=m4Be0hRQGIs&list=RDm4Be0hRQGIs&start_radio=1")
+        == "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    )
+    assert normalize_url("https://youtu.be/m4Be0hRQGIs?si=abc") == (
+        "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    )
+    assert normalize_url("https://m.youtube.com/watch?v=m4Be0hRQGIs&feature=share") == (
+        "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    )
+    assert normalize_url("https://www.youtube.com/shorts/m4Be0hRQGIs?si=abc") == (
+        "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    )
+    with pytest.raises(UserFacingError, match="playlist"):
+        normalize_url("https://www.youtube.com/playlist?list=PL123")
 
 
 def test_size_limits_and_format_options(tmp_path):
@@ -83,9 +115,24 @@ def test_size_limits_and_format_options(tmp_path):
     best = _download_options("best", tmp_path, settings, lambda data: None, lambda data: None)
     assert "mp4" in best["format"]
     assert best["merge_output_format"] == "mp4"
+    assert best["concurrent_fragment_downloads"] == 4
+    assert "cookiefile" not in best
+    assert "cookiesfrombrowser" not in best
 
     mp3 = _download_options("mp3", tmp_path, settings, lambda data: None, lambda data: None)
     assert mp3["postprocessors"][0]["preferredcodec"] == "mp3"
+
+    selector_720 = _download_options("720", tmp_path, settings, lambda data: None, lambda data: None)
+    assert "height<=720" in selector_720["format"]
+
+
+def test_error_mapping():
+    assert _map_ytdlp_error(DownloadError("Sign in to confirm your age")).status_code == 403
+    assert "login" in _map_ytdlp_error(DownloadError("This video is private")).message
+    assert "formatos" in _map_ytdlp_error(DownloadError("No video formats found")).message
+    assert "red" in _map_ytdlp_error(DownloadError("Connection reset by peer")).message
+    assert "ffmpeg" in _map_ytdlp_error(DownloadError("ffmpeg is not installed")).message
+    assert _map_ytdlp_error(DownloadError("This video is DRM protected")).status_code == 403
 
 
 def test_sanitize_filename(tmp_path):

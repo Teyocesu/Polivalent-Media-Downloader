@@ -95,6 +95,10 @@ export default function App() {
     try {
       const info = await getInfo(url, token);
       setMetadata(info);
+      if (info.normalizedUrl && info.normalizedUrl !== url.trim()) {
+        setUrl(info.normalizedUrl);
+        setNotice("URL de YouTube limpiada. Se usara el video individual.");
+      }
       setQuality(info.availableQualities?.[0] || "best");
       setViewState("ready");
     } catch (err) {
@@ -110,7 +114,14 @@ export default function App() {
     try {
       const result = await startDownload(url, quality, token);
       setJobId(result.jobId);
-      setJob({ jobId: result.jobId, status: result.status, progress: 0, message: "En cola..." });
+      setJob({
+        jobId: result.jobId,
+        status: result.status,
+        phase: "queued",
+        phaseLabel: "En cola",
+        progress: 0,
+        message: "En cola...",
+      });
     } catch (err) {
       handleApiError(err);
     }
@@ -310,6 +321,11 @@ export default function App() {
                 </option>
               ))}
             </select>
+            <p className="quality-hint">
+              {quality === "best"
+                ? "Mejor calidad puede tardar mas."
+                : "Para descargas mas rapidas en celular, 720p suele ser suficiente."}
+            </p>
           </div>
 
           <button
@@ -326,12 +342,45 @@ export default function App() {
       {job ? (
         <section className="progress-panel" aria-live="polite">
           <div className="progress-header">
-            <span>{job.message || "Procesando..."}</span>
+            <span>{job.phaseLabel || job.message || "Procesando..."}</span>
             <strong>{job.progress || 0}%</strong>
           </div>
           <div className="progress-track">
-            <div className="progress-bar" style={{ width: `${job.progress || 0}%` }} />
+            <div
+              className={`progress-bar ${job.downloadPercent == null && viewState === "downloading" ? "is-indeterminate" : ""}`}
+              style={{ width: `${job.progress || 0}%` }}
+            />
           </div>
+          <p className="progress-message">{job.message || "Procesando..."}</p>
+          <dl className="download-stats">
+            {job.speed ? (
+              <>
+                <dt>Velocidad</dt>
+                <dd>{job.speed}</dd>
+              </>
+            ) : null}
+            {job.eta ? (
+              <>
+                <dt>ETA</dt>
+                <dd>{job.eta}</dd>
+              </>
+            ) : null}
+            {job.downloadedBytes ? (
+              <>
+                <dt>Datos</dt>
+                <dd>
+                  {formatBytes(job.downloadedBytes)}
+                  {job.totalBytes ? ` / ${formatBytes(job.totalBytes)}` : ""}
+                </dd>
+              </>
+            ) : null}
+            {job.currentFile ? (
+              <>
+                <dt>Archivo</dt>
+                <dd>{job.currentFile}</dd>
+              </>
+            ) : null}
+          </dl>
           {viewState === "done" ? (
             <button
               className="primary-button full-width"
@@ -349,6 +398,21 @@ export default function App() {
       {error ? <p className="error-text">{error}</p> : null}
     </main>
   );
+}
+
+function formatBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size <= 0) {
+    return "";
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  let current = size;
+  let unit = 0;
+  while (current >= 1024 && unit < units.length - 1) {
+    current /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${Math.round(current)} ${units[unit]}` : `${current.toFixed(1)} ${units[unit]}`;
 }
 
 function formatDuration(seconds) {
