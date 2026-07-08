@@ -10,6 +10,10 @@ backend/static/
 tmp/
 downloads/
 media-downloads/
+cookies.txt
+youtube-cookies.txt
+*.cookies
+*cookies*.txt
 .pytest_cache/
 .playwright-cli/
 .DS_Store

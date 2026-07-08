@@ -10,10 +10,12 @@ from backend.app.downloader import (
     _download_options,
     _ensure_size_allowed,
     _map_ytdlp_error,
+    _metadata_options,
 )
 from backend.app.jobs import DownloadJob, JobManager
 from backend.app.security import create_token, verify_token
 from backend.app.utils import UserFacingError, normalize_url, sanitize_filename, validate_media_url
+from backend.app.youtube_auth import get_youtube_cookie_options, get_youtube_cookie_status
 
 
 def make_settings(tmp_path, max_file_mb=1, ttl_minutes=1):
@@ -126,13 +128,115 @@ def test_size_limits_and_format_options(tmp_path):
     assert "height<=720" in selector_720["format"]
 
 
+def test_youtube_cookie_file_options(tmp_path):
+    missing = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "youtube_cookies_enabled": True,
+            "youtube_cookies_path": tmp_path / "missing-cookies.txt",
+        }
+    )
+    missing_status = get_youtube_cookie_status(missing)
+    assert missing_status == {
+        "enabled": True,
+        "configured": True,
+        "readable": False,
+        "mode": "file",
+    }
+    assert get_youtube_cookie_options(missing) == {}
+
+    cookie_file = tmp_path / "youtube-cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tTEST_COOKIE\tplaceholder\n"
+    )
+    configured = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "youtube_cookies_enabled": True,
+            "youtube_cookies_path": cookie_file,
+        }
+    )
+    assert get_youtube_cookie_status(configured)["readable"] is True
+    assert get_youtube_cookie_options(configured) == {"cookiefile": str(cookie_file)}
+
+    metadata_options = _metadata_options(
+        configured,
+        {"debug_code": "default", "options": {}},
+        "https://www.youtube.com/watch?v=m4Be0hRQGIs",
+    )
+    assert metadata_options["cookiefile"] == str(cookie_file)
+
+    download_options = _download_options(
+        "720",
+        tmp_path,
+        configured,
+        lambda data: None,
+        lambda data: None,
+        url="https://www.youtube.com/watch?v=m4Be0hRQGIs",
+    )
+    assert download_options["cookiefile"] == str(cookie_file)
+
+    x_options = _download_options(
+        "720",
+        tmp_path,
+        configured,
+        lambda data: None,
+        lambda data: None,
+        url="https://x.com/user/status/123",
+    )
+    assert "cookiefile" not in x_options
+
+
+def test_youtube_browser_cookie_mode_is_local_only(tmp_path):
+    local = Settings(
+        **{
+            **make_settings(tmp_path).__dict__,
+            "youtube_cookies_enabled": True,
+            "youtube_cookies_from_browser": "chrome",
+        }
+    )
+    assert get_youtube_cookie_status(local)["mode"] == "browser"
+    assert get_youtube_cookie_options(local) == {"cookiesfrombrowser": ("chrome",)}
+
+    production = Settings(**{**local.__dict__, "environment": "production"})
+    assert get_youtube_cookie_status(production)["mode"] == "none"
+    assert get_youtube_cookie_options(production) == {}
+
+
 def test_error_mapping():
     assert _map_ytdlp_error(DownloadError("Sign in to confirm your age")).status_code == 403
     assert "login" in _map_ytdlp_error(DownloadError("This video is private")).message
     assert "formatos" in _map_ytdlp_error(DownloadError("No video formats found")).message
     assert "red" in _map_ytdlp_error(DownloadError("Connection reset by peer")).message
+    assert "red" in _map_ytdlp_error(DownloadError("Could not resolve host: www.youtube.com")).message
     assert "ffmpeg" in _map_ytdlp_error(DownloadError("ffmpeg is not installed")).message
     assert _map_ytdlp_error(DownloadError("This video is DRM protected")).status_code == 403
+
+
+def test_youtube_no_bot_error_mapping(tmp_path):
+    no_cookies = make_settings(tmp_path)
+    no_bot = DownloadError("Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies")
+    assert "cookies de YouTube" in _map_ytdlp_error(no_bot, no_cookies).message
+
+    enabled_missing = Settings(
+        **{
+            **no_cookies.__dict__,
+            "youtube_cookies_enabled": True,
+            "youtube_cookies_path": tmp_path / "missing.txt",
+        }
+    )
+    assert "archivo no existe" in _map_ytdlp_error(no_bot, enabled_missing).message
+
+    cookie_file = tmp_path / "youtube-cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n")
+    enabled_readable = Settings(
+        **{
+            **no_cookies.__dict__,
+            "youtube_cookies_enabled": True,
+            "youtube_cookies_path": cookie_file,
+        }
+    )
+    assert "rechazó" in _map_ytdlp_error(no_bot, enabled_readable).message
 
 
 def test_sanitize_filename(tmp_path):

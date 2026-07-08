@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,28 @@ def _parse_csv(name: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_optional_path(name: str) -> Optional[Path]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return Path(value.strip())
+
+
+def _parse_optional_text(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    normalized = value.strip().lower()
+    return None if normalized == "none" else normalized
+
+
 @dataclass(frozen=True)
 class Settings:
     app_password: str
@@ -57,6 +80,9 @@ class Settings:
     download_base_dir: Path
     port: int
     environment: str
+    youtube_cookies_enabled: bool = False
+    youtube_cookies_path: Optional[Path] = None
+    youtube_cookies_from_browser: str | None = None
 
     @property
     def max_file_bytes(self) -> int:
@@ -95,4 +121,7 @@ def get_settings() -> Settings:
         download_base_dir=Path(os.getenv("DOWNLOAD_BASE_DIR", "/tmp/media-downloads")),
         port=_parse_int("PORT", 8000),
         environment=environment,
+        youtube_cookies_enabled=_parse_bool("YOUTUBE_COOKIES_ENABLED", False),
+        youtube_cookies_path=_parse_optional_path("YOUTUBE_COOKIES_PATH"),
+        youtube_cookies_from_browser=_parse_optional_text("YOUTUBE_COOKIES_FROM_BROWSER"),
     )

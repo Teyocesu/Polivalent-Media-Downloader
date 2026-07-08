@@ -51,7 +51,11 @@ export default function App() {
         if (nextJob.status === "done") {
           setViewState("done");
         } else if (nextJob.status === "error" || nextJob.status === "expired") {
-          setError(nextJob.message || "La descarga no esta disponible.");
+          const message = nextJob.message || "La descarga no esta disponible.";
+          setError(formatApiMessage(message));
+          if (isYoutubeVerificationMessage(message)) {
+            setNotice("Esto suele pasar en servidores cloud como Render.");
+          }
           setViewState("error");
         }
       } catch (err) {
@@ -200,7 +204,11 @@ export default function App() {
       return;
     }
 
-    setError(err?.message || "No se pudo completar la accion.");
+    const message = err?.message || "No se pudo completar la accion.";
+    setError(formatApiMessage(message));
+    if (isYoutubeVerificationMessage(message)) {
+      setNotice("Esto suele pasar en servidores cloud como Render.");
+    }
     if (fallbackState) {
       setViewState(fallbackState);
     }
@@ -413,6 +421,17 @@ function formatBytes(value) {
     unit += 1;
   }
   return unit === 0 ? `${Math.round(current)} ${units[unit]}` : `${current.toFixed(1)} ${units[unit]}`;
+}
+
+function formatApiMessage(message) {
+  if (isYoutubeVerificationMessage(message)) {
+    return "YouTube está pidiendo verificación. Esta app necesita cookies de YouTube configuradas en Render para este video.";
+  }
+  return message;
+}
+
+function isYoutubeVerificationMessage(message) {
+  return /youtube.*(verificaci[oó]n|no-bot|cookies)/i.test(message || "");
 }
 
 function formatDuration(seconds) {

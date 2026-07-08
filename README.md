@@ -30,6 +30,9 @@ DOWNLOAD_TIMEOUT_SECONDS=600
 ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 PORT=8000
 ENVIRONMENT=development
+YOUTUBE_COOKIES_ENABLED=false
+YOUTUBE_COOKIES_PATH=
+YOUTUBE_COOKIES_FROM_BROWSER=none
 ```
 
 En produccion, `APP_PASSWORD` es obligatoria. `APP_SECRET_KEY` es opcional, pero recomendado para firmar tokens con una clave distinta de la contrasena. En Render tambien conviene usar `ENVIRONMENT=production`.
@@ -106,11 +109,47 @@ MAX_FILE_MB=500
 DOWNLOAD_TTL_MINUTES=15
 DOWNLOAD_TIMEOUT_SECONDS=600
 ENVIRONMENT=production
+YOUTUBE_COOKIES_ENABLED=false
 ```
 
 Render define `PORT` automaticamente. El backend escucha en `0.0.0.0` y usa esa variable.
 
-La imagen Docker instala `ffmpeg`, `ffprobe`, `nodejs`, `yt-dlp[default,curl-cffi]` y `yt-dlp-ejs` en runtime. No usa cookies ni login.
+La imagen Docker instala `ffmpeg`, `ffprobe`, `nodejs`, `yt-dlp[default,curl-cffi]` y `yt-dlp-ejs` en runtime. No usa cookies ni login por defecto.
+
+## YouTube en Render: configurar cookies
+
+Si YouTube responde `Sign in to confirm you're not a bot` desde Render, podés configurar cookies propias de YouTube como Secret File. Usá esto solo para contenido al que tu cuenta pueda acceder normalmente. No sirve para DRM, paywalls ni contenido inaccesible para esa cuenta.
+
+Recomendacion fuerte: usá una cuenta secundaria de Google/YouTube, no tu cuenta principal.
+
+1. Exportá un `cookies.txt` de YouTube en formato Netscape desde un navegador donde esa cuenta secundaria esté logueada.
+2. No commitees ese archivo.
+3. No lo subas al repo.
+4. En Render, entrá al servicio.
+5. Abrí `Environment`.
+6. En `Secret Files`, elegí `Add Secret File`.
+7. Usá `youtube-cookies.txt` como filename.
+8. Pegá el contenido completo del `cookies.txt`.
+9. Agregá estas variables:
+
+```text
+YOUTUBE_COOKIES_ENABLED=true
+YOUTUBE_COOKIES_PATH=/etc/secrets/youtube-cookies.txt
+YOUTUBE_COOKIES_FROM_BROWSER=none
+```
+
+10. Redeployá el servicio.
+
+Las cookies pueden expirar o quedar invalidadas. Si YouTube vuelve a rechazar la descarga, exportá cookies nuevas, actualizá el Secret File y redeployá. Si YouTube cambia sus protecciones, puede seguir fallando aun con cookies.
+
+Para desarrollo local sin Docker podés usar cookies del navegador local:
+
+```bash
+YOUTUBE_COOKIES_ENABLED=true
+YOUTUBE_COOKIES_FROM_BROWSER=chrome
+```
+
+En Docker local es mejor montar un `youtube-cookies.txt` como volumen y apuntar `YOUTUBE_COOKIES_PATH` a esa ruta dentro del contenedor.
 
 ## Actualizar yt-dlp
 
@@ -131,7 +170,7 @@ pip install -U yt-dlp
 
 En Render, hacé un nuevo deploy para que la imagen instale la version disponible de `yt-dlp`.
 
-Si YouTube cambia algo y empieza a fallar, forzá un redeploy o un deploy manual desde Render para reconstruir la imagen e instalar una version nueva de `yt-dlp`. La app no usa cookies del usuario, navegador logueado ni credenciales de plataformas.
+Si YouTube cambia algo y empieza a fallar, forzá un redeploy o un deploy manual desde Render para reconstruir la imagen e instalar una version nueva de `yt-dlp`. Las cookies de YouTube son opcionales y deben configurarse como Secret File, nunca en el repo.
 
 ## Debug seguro
 
@@ -143,6 +182,7 @@ Si YouTube cambia algo y empieza a fallar, forzá un redeploy o un deploy manual
 - carpeta temporal
 - limites de tamano y timeout
 - entorno
+- estado de cookies de YouTube: `youtubeCookiesEnabled`, `youtubeCookiesConfigured`, `youtubeCookiesReadable`, `youtubeCookiesMode`
 
 En produccion requiere `Authorization: Bearer <token>`.
 

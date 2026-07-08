@@ -20,6 +20,7 @@ from .jobs import JobGone, JobManager, JobNotReady
 from .rate_limit import FixedWindowRateLimiter
 from .security import create_token, verify_password, verify_token
 from .utils import UserFacingError, validate_media_url
+from .youtube_auth import get_youtube_cookie_status
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -219,6 +220,7 @@ def _client_key(request: Request) -> str:
 
 
 def _system_debug_payload() -> dict:
+    youtube_cookie_status = get_youtube_cookie_status(settings)
     return {
         "ytDlpVersion": ytdlp_version,
         "ffmpegAvailable": shutil.which("ffmpeg") is not None,
@@ -229,4 +231,8 @@ def _system_debug_payload() -> dict:
         "maxFileMb": settings.max_file_mb,
         "downloadTimeoutSeconds": settings.download_timeout_seconds,
         "environment": settings.environment,
+        "youtubeCookiesEnabled": youtube_cookie_status["enabled"],
+        "youtubeCookiesConfigured": youtube_cookie_status["configured"],
+        "youtubeCookiesReadable": youtube_cookie_status["readable"],
+        "youtubeCookiesMode": youtube_cookie_status["mode"],
     }

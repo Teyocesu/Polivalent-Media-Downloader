@@ -288,5 +288,11 @@ def test_debug_system_requires_no_secret_and_reports_runtime(client):
     assert "ffprobeAvailable" in payload
     assert "nodeAvailable" in payload
     assert "denoAvailable" in payload
+    assert payload["youtubeCookiesEnabled"] is False
+    assert payload["youtubeCookiesConfigured"] is False
+    assert payload["youtubeCookiesReadable"] is False
+    assert payload["youtubeCookiesMode"] == "none"
+    assert "youtube-cookies.txt" not in response.text
+    assert "/etc/secrets" not in response.text
     assert "APP_PASSWORD" not in response.text
     assert "test-password" not in response.text

@@ -12,6 +12,7 @@ from yt_dlp.utils import DownloadError
 
 from .config import Settings
 from .utils import UserFacingError, sanitize_filename
+from .youtube_auth import get_youtube_cookie_options, get_youtube_cookie_status
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,14 @@ NO_FORMATS_MESSAGE = "No se encontraron formatos descargables para este video."
 NETWORK_MESSAGE = "Hubo un problema de red al conectar con la plataforma."
 FFMPEG_MISSING_MESSAGE = "ffmpeg no esta disponible en el servidor. Revisa el Dockerfile o el deploy."
 DRM_MESSAGE = "Este contenido parece protegido con DRM o no descargable por esta app."
+YOUTUBE_NO_BOT_MESSAGE = (
+    "YouTube pidió verificación de cuenta/no-bot. Configurá cookies de YouTube en Render "
+    "para descargar este video."
+)
+YOUTUBE_COOKIES_MISSING_MESSAGE = (
+    "Las cookies de YouTube están activadas, pero el archivo no existe o no se puede leer."
+)
+YOUTUBE_COOKIES_REJECTED_MESSAGE = "YouTube rechazó estas cookies. Exportá cookies nuevas y redeployá."
 
 
 class DownloadCancelled(Exception):
@@ -49,7 +58,7 @@ def fetch_metadata(url: str, settings: Settings) -> dict:
     info = None
     last_error: Exception | None = None
     for attempt in _attempt_profiles(url):
-        options = _metadata_options(settings, attempt)
+        options = _metadata_options(settings, attempt, url)
         try:
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -73,7 +82,7 @@ def fetch_metadata(url: str, settings: Settings) -> dict:
             )
 
     if info is None:
-        raise _map_ytdlp_error(last_error)
+        raise _map_ytdlp_error(last_error, settings)
 
     _ensure_single_downloadable_item(info)
     _ensure_not_live(info)
@@ -191,7 +200,15 @@ def download_media(
     code = 1
     last_error: Exception | None = None
     for attempt in _attempt_profiles(url):
-        options = _download_options(quality, temp_dir, settings, progress_hook, postprocessor_hook, attempt)
+        options = _download_options(
+            quality,
+            temp_dir,
+            settings,
+            progress_hook,
+            postprocessor_hook,
+            attempt,
+            url,
+        )
         _emit(
             progress_callback,
             status="downloading",
@@ -232,7 +249,7 @@ def download_media(
             code = 1
 
     if code != 0:
-        raise _map_ytdlp_error(last_error)
+        raise _map_ytdlp_error(last_error, settings)
 
     output_file = _find_output_file(temp_dir)
     if output_file.stat().st_size > settings.max_file_bytes:
@@ -275,7 +292,7 @@ PHASE_LABELS = {
 }
 
 
-def _metadata_options(settings: Settings, attempt: dict) -> dict:
+def _metadata_options(settings: Settings, attempt: dict, url: str | None = None) -> dict:
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -287,6 +304,8 @@ def _metadata_options(settings: Settings, attempt: dict) -> dict:
         "fragment_retries": 2,
     }
     options.update(attempt["options"])
+    if url and _is_youtube_url(url):
+        options.update(_youtube_cookie_options(settings))
     return options
 
 
@@ -297,6 +316,7 @@ def _download_options(
     progress_hook: Callable[[dict], None],
     postprocessor_hook: Callable[[dict], None],
     attempt: dict | None = None,
+    url: str | None = None,
 ) -> dict:
     options = {
         "quiet": True,
@@ -319,6 +339,8 @@ def _download_options(
     }
     if attempt:
         options.update(attempt["options"])
+    if url and _is_youtube_url(url):
+        options.update(_youtube_cookie_options(settings))
     if quality == "mp3":
         options["postprocessors"] = [
             {
@@ -327,6 +349,19 @@ def _download_options(
                 "preferredquality": "192",
             }
         ]
+    return options
+
+
+def _youtube_cookie_options(settings: Settings) -> dict:
+    status = get_youtube_cookie_status(settings)
+    options = get_youtube_cookie_options(settings)
+    if status["enabled"] and not options:
+        logger.warning(
+            "youtube cookies enabled but unavailable mode=%s configured=%s readable=%s",
+            status["mode"],
+            status["configured"],
+            status["readable"],
+        )
     return options
 
 
@@ -518,7 +553,7 @@ def _current_filename(data: dict) -> str | None:
     return Path(filename).name if filename else None
 
 
-def _map_ytdlp_error(exc: Exception | None) -> UserFacingError:
+def _map_ytdlp_error(exc: Exception | None, settings: Settings | None = None) -> UserFacingError:
     if exc is None:
         return UserFacingError(PLATFORM_FAILURE_MESSAGE)
     message = str(exc)
@@ -527,6 +562,14 @@ def _map_ytdlp_error(exc: Exception | None) -> UserFacingError:
         return UserFacingError(FFMPEG_MISSING_MESSAGE, status_code=500)
     if "drm" in lowered:
         return UserFacingError(DRM_MESSAGE, status_code=403)
+    if _is_youtube_no_bot_error(lowered):
+        if settings:
+            status = get_youtube_cookie_status(settings)
+            if status["enabled"] and not (status["configured"] and status["readable"]):
+                return UserFacingError(YOUTUBE_COOKIES_MISSING_MESSAGE, status_code=500)
+            if status["configured"] and status["readable"]:
+                return UserFacingError(YOUTUBE_COOKIES_REJECTED_MESSAGE, status_code=403)
+        return UserFacingError(YOUTUBE_NO_BOT_MESSAGE, status_code=403)
     if any(term in lowered for term in ("private", "login", "sign in", "cookies", "age-restricted")):
         return UserFacingError(PRIVATE_OR_LOGIN_MESSAGE, status_code=403)
     if any(
@@ -549,11 +592,21 @@ def _map_ytdlp_error(exc: Exception | None) -> UserFacingError:
             "connection aborted",
             "network is unreachable",
             "name or service not known",
+            "failed to resolve",
+            "could not resolve host",
             "http error 5",
         )
     ):
         return UserFacingError(NETWORK_MESSAGE, status_code=503)
     return UserFacingError(PLATFORM_FAILURE_MESSAGE)
+
+
+def _is_youtube_no_bot_error(lowered: str) -> bool:
+    return (
+        "not a bot" in lowered
+        or "use --cookies-from-browser" in lowered
+        or "use --cookies" in lowered
+    )
 
 
 def _is_non_retryable_error(exc: Exception) -> bool:
