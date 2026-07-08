@@ -1,0 +1,17 @@
+{
+  "name": "Private Media Downloader",
+  "short_name": "Downloader",
+  "description": "App privada para descargar contenido publico permitido.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#111316",
+  "theme_color": "#111316",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

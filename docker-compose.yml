@@ -1,0 +1,11 @@
+services:
+  media-downloader:
+    build: .
+    env_file:
+      - .env
+    environment:
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    tmpfs:
+      - /tmp/media-downloads
