@@ -1,27 +1,35 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  authorizeFileDownload,
   cancelJob,
-  downloadFile,
   getInfo,
   getJob,
   login,
   startDownload,
 } from "./api.js";
+import {
+  DEFAULT_QUALITY,
+  chooseDefaultQuality,
+  formatApiMessage,
+  formatBytes,
+  formatDuration,
+  getAvailableQualityOptions,
+  getDownloadButtonLabel,
+  getDownloadPercent,
+  getPhaseLabel,
+  getProgressValue,
+  getQualityHint,
+  getYoutubeSupportNotice,
+} from "./ux.js";
 
 const TOKEN_KEY = "private-media-downloader-token";
-const qualities = [
-  { value: "best", label: "Mejor compatible" },
-  { value: "1080", label: "1080p" },
-  { value: "720", label: "720p" },
-  { value: "480", label: "480p" },
-  { value: "mp3", label: "Solo audio MP3" },
-];
+const TRANSFER_PHASES = new Set(["downloading", "downloading_video", "downloading_audio"]);
 
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [password, setPassword] = useState("");
   const [url, setUrl] = useState("");
-  const [quality, setQuality] = useState("best");
+  const [quality, setQuality] = useState(DEFAULT_QUALITY);
   const [viewState, setViewState] = useState(token ? "idle" : "loggedOut");
   const [metadata, setMetadata] = useState(null);
   const [job, setJob] = useState(null);
@@ -29,10 +37,15 @@ export default function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const operationIdRef = useRef(0);
 
   const isBusy = useMemo(
     () => ["analyzing", "downloading"].includes(viewState) || isSaving,
     [viewState, isSaving],
+  );
+  const availableQualities = useMemo(
+    () => getAvailableQualityOptions(metadata?.availableQualities),
+    [metadata?.availableQualities],
   );
 
   useEffect(() => {
@@ -41,27 +54,43 @@ export default function App() {
     }
 
     let cancelled = false;
+    let polling = false;
+    let consecutiveFailures = 0;
     const poll = async () => {
+      if (polling) {
+        return;
+      }
+      polling = true;
       try {
         const nextJob = await getJob(jobId, token);
         if (cancelled) {
           return;
         }
+        consecutiveFailures = 0;
+        setNotice((current) => (current.startsWith("Conexión inestable.") ? "" : current));
         setJob(nextJob);
         if (nextJob.status === "done") {
           setViewState("done");
         } else if (nextJob.status === "error" || nextJob.status === "expired") {
-          const message = nextJob.message || "La descarga no esta disponible.";
+          const message = nextJob.message || "La descarga no está disponible.";
           setError(formatApiMessage(message));
-          if (isYoutubeVerificationMessage(message)) {
-            setNotice("Esto suele pasar en servidores cloud como Render.");
-          }
-          setViewState("error");
+          setNotice(getYoutubeSupportNotice(message));
+          setViewState(nextJob.status === "expired" ? "expired" : "error");
         }
       } catch (err) {
         if (!cancelled) {
-          handleApiError(err);
+          const canRetry = !err?.status || err.status >= 500;
+          consecutiveFailures += 1;
+          if (canRetry && consecutiveFailures <= 3) {
+            setNotice(
+              `Conexión inestable. Reintentando estado de la descarga (${consecutiveFailures}/3)...`,
+            );
+          } else {
+            handleApiError(err);
+          }
         }
+      } finally {
+        polling = false;
       }
     };
 
@@ -84,55 +113,80 @@ export default function App() {
       setPassword("");
       setViewState("idle");
     } catch (err) {
-      setError(err.message);
+      setError(formatApiMessage(err?.message));
     }
   }
 
   async function handleAnalyze(event) {
     event.preventDefault();
+    const operationId = ++operationIdRef.current;
+    const previousJobId = jobId;
     setError("");
     setNotice("");
     setMetadata(null);
     setJob(null);
     setJobId("");
     setViewState("analyzing");
+    if (previousJobId) {
+      void cancelJob(previousJobId, token).catch(() => undefined);
+    }
     try {
       const info = await getInfo(url, token);
+      if (operationIdRef.current !== operationId) {
+        return;
+      }
       setMetadata(info);
       if (info.normalizedUrl && info.normalizedUrl !== url.trim()) {
         setUrl(info.normalizedUrl);
-        setNotice("URL de YouTube limpiada. Se usara el video individual.");
+        setNotice("URL de YouTube normalizada. Se usará únicamente el video indicado.");
       }
-      setQuality(info.availableQualities?.[0] || "best");
+      setQuality(chooseDefaultQuality(info.availableQualities));
       setViewState("ready");
     } catch (err) {
-      handleApiError(err);
+      if (operationIdRef.current === operationId) {
+        handleApiError(err);
+      }
     }
   }
 
   async function handleStartDownload() {
+    const operationId = ++operationIdRef.current;
     setError("");
     setNotice("");
-    setJob(null);
+    setJobId("");
+    setJob({
+      status: "downloading",
+      phase: "validating_url",
+      progress: 2,
+      message: "Validando el link antes de descargar...",
+      step: 1,
+      stepsTotal: quality === "mp3" ? 6 : 5,
+    });
     setViewState("downloading");
     try {
       const result = await startDownload(url, quality, token);
+      if (operationIdRef.current !== operationId) {
+        await cancelJob(result.jobId, token).catch(() => undefined);
+        return;
+      }
       setJobId(result.jobId);
-      setJob({
+      setJob((current) => ({
+        ...current,
         jobId: result.jobId,
         status: result.status,
         phase: "queued",
-        phaseLabel: "En cola",
         progress: 0,
         message: "En cola...",
-      });
+      }));
     } catch (err) {
-      handleApiError(err);
+      if (operationIdRef.current === operationId) {
+        handleApiError(err);
+      }
     }
   }
 
   async function handleSaveFile() {
-    if (!jobId) {
+    if (!jobId || isSaving) {
       return;
     }
 
@@ -140,38 +194,79 @@ export default function App() {
     setError("");
     setNotice("");
     try {
-      const { blob, filename } = await downloadFile(jobId, token);
-      const objectUrl = URL.createObjectURL(blob);
+      const downloadUrl = await authorizeFileDownload(jobId, token);
       const anchor = document.createElement("a");
-      anchor.href = objectUrl;
-      anchor.download = filename;
+      anchor.href = downloadUrl;
+      anchor.download = "";
+      anchor.rel = "noopener";
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1200);
-      setNotice("Archivo entregado. Se borrara del servidor automaticamente.");
+      setViewState("delivered");
+      setNotice(
+        "La descarga del archivo comenzó. La copia temporal del servidor ya no puede volver a usarse.",
+      );
       setJob((current) =>
         current
-          ? { ...current, status: "expired", message: "Archivo entregado.", progress: 100 }
+          ? {
+              ...current,
+              status: "expired",
+              phase: "delivered",
+              phaseLabel: "Entregado y eliminado",
+              message: "Archivo entregado y eliminado del servidor.",
+              progress: 100,
+            }
           : current,
       );
     } catch (err) {
-      handleApiError(err, null);
+      setJob((current) =>
+        current
+          ? {
+              ...current,
+              status: err?.status === 410 ? "expired" : "error",
+              phase: err?.status === 410 ? "expired" : "error",
+              message: formatApiMessage(err?.message),
+            }
+          : current,
+      );
+      handleApiError(err, err?.status === 410 ? "expired" : "error");
     } finally {
       setIsSaving(false);
     }
   }
 
   async function handleClear() {
-    if (jobId && viewState === "downloading") {
-      try {
-        await cancelJob(jobId, token);
-      } catch {
-        // The cleanup timer will remove stale temporary files if the cancel request cannot finish.
-      }
+    operationIdRef.current += 1;
+    const activeJobId = jobId;
+    const shouldCancel = activeJobId && !["delivered", "expired"].includes(viewState);
+    resetDownloadState();
+    if (shouldCancel) {
+      await cancelJob(activeJobId, token).catch(() => undefined);
     }
+  }
+
+  function handleLogout() {
+    operationIdRef.current += 1;
+    const activeJobId = jobId;
+    const activeToken = token;
+    const shouldCancel = activeJobId && !["delivered", "expired"].includes(viewState);
+    localStorage.removeItem(TOKEN_KEY);
+    setToken("");
+    setPassword("");
+    setViewState("loggedOut");
+    setMetadata(null);
+    setJob(null);
+    setJobId("");
+    setNotice("");
+    setError("");
+    if (shouldCancel) {
+      void cancelJob(activeJobId, activeToken).catch(() => undefined);
+    }
+  }
+
+  function resetDownloadState() {
     setUrl("");
-    setQuality("best");
+    setQuality(DEFAULT_QUALITY);
     setMetadata(null);
     setJob(null);
     setJobId("");
@@ -180,19 +275,9 @@ export default function App() {
     setViewState(token ? "idle" : "loggedOut");
   }
 
-  function handleLogout() {
-    localStorage.removeItem(TOKEN_KEY);
-    setToken("");
-    setViewState("loggedOut");
-    setMetadata(null);
-    setJob(null);
-    setJobId("");
-    setNotice("");
-    setError("");
-  }
-
   function handleApiError(err, fallbackState = "error") {
     if (err?.status === 401) {
+      operationIdRef.current += 1;
       localStorage.removeItem(TOKEN_KEY);
       setToken("");
       setViewState("loggedOut");
@@ -200,15 +285,13 @@ export default function App() {
       setJob(null);
       setJobId("");
       setNotice("");
-      setError("Sesion expirada. Volve a entrar.");
+      setError("Tu sesión venció o no es válida. Volvé a ingresar.");
       return;
     }
 
-    const message = err?.message || "No se pudo completar la accion.";
+    const message = err?.message || "No se pudo completar la acción.";
     setError(formatApiMessage(message));
-    if (isYoutubeVerificationMessage(message)) {
-      setNotice("Esto suele pasar en servidores cloud como Render.");
-    }
+    setNotice(getYoutubeSupportNotice(message));
     if (fallbackState) {
       setViewState(fallbackState);
     }
@@ -221,8 +304,11 @@ export default function App() {
           <div className="brand-mark" aria-hidden="true">
             MD
           </div>
+          <p className="eyebrow">Acceso privado</p>
           <h1 id="login-title">Media Downloader</h1>
-          <p className="muted">App privada para guardar contenido publico permitido.</p>
+          <p className="muted" id="login-help">
+            Ingresá con la contraseña configurada por el administrador.
+          </p>
           <form className="stack" onSubmit={handleLogin}>
             <input
               type="hidden"
@@ -231,7 +317,7 @@ export default function App() {
               value="private-user"
               readOnly
             />
-            <label htmlFor="password">Contrasena</label>
+            <label htmlFor="password">Contraseña</label>
             <input
               id="password"
               name="password"
@@ -240,50 +326,80 @@ export default function App() {
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               placeholder="Tu APP_PASSWORD"
+              aria-describedby="login-help"
             />
             <button className="primary-button" type="submit" disabled={!password.trim()}>
-              Entrar
+              Ingresar
             </button>
           </form>
-          {error ? <p className="error-text">{error}</p> : null}
+          {error ? (
+            <p className="error-text" role="alert">
+              {error}
+            </p>
+          ) : null}
         </section>
       </main>
     );
   }
 
+  const analysisJob =
+    viewState === "analyzing"
+      ? {
+          status: "analyzing",
+          phase: "extracting_metadata",
+          progress: null,
+          message: "Validando el link, normalizando la URL y leyendo metadata...",
+        }
+      : null;
+  const visibleJob = job || analysisJob;
+
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div>
+        <div className="title-block">
           <p className="eyebrow">Privado y temporal</p>
           <h1>Media Downloader</h1>
         </div>
-        <button className="ghost-button compact" type="button" onClick={handleLogout}>
-          Salir
+        <button
+          className="ghost-button compact logout-button"
+          type="button"
+          onClick={handleLogout}
+          disabled={isSaving}
+        >
+          Cerrar sesión
         </button>
       </header>
 
+      <section className="intro-panel" aria-label="Cómo funciona">
+        <strong>Sin historial ni biblioteca.</strong>
+        <span>Cada archivo se guarda una sola vez y después se elimina del servidor.</span>
+      </section>
+
       <form className="download-form" onSubmit={handleAnalyze}>
-        <label htmlFor="media-url">Link publico</label>
+        <label htmlFor="media-url">Link del video</label>
         <textarea
           id="media-url"
           rows="3"
           value={url}
           onChange={(event) => setUrl(event.target.value)}
-          placeholder="Pega un link de YouTube, TikTok, Instagram o X"
+          placeholder="Pegá un link de YouTube, TikTok, Instagram o X"
           disabled={isBusy}
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
         />
         <div className="action-row">
           <button className="primary-button" type="submit" disabled={!url.trim() || isBusy}>
-            {viewState === "analyzing" ? "Analizando..." : "Analizar"}
+            {viewState === "analyzing" ? "Analizando link..." : "Analizar link"}
           </button>
           <button className="ghost-button" type="button" onClick={handleClear} disabled={isSaving}>
-            Limpiar
+            {viewState === "downloading" ? "Cancelar y limpiar" : "Limpiar"}
           </button>
         </div>
       </form>
 
-      <p className="legal-note">Usa esto solo con contenido que tengas derecho a guardar.</p>
+      <p className="legal-note">Usalo sólo con contenido que tengas derecho a guardar.</p>
 
       {metadata ? (
         <section className="result-panel" aria-labelledby="result-title">
@@ -295,7 +411,7 @@ export default function App() {
                 Video
               </div>
             )}
-            <div>
+            <div className="media-copy">
               <p className="eyebrow">{metadata.site}</p>
               <h2 id="result-title">{metadata.title}</h2>
               <dl className="meta-list">
@@ -307,8 +423,14 @@ export default function App() {
                 ) : null}
                 {metadata.duration ? (
                   <>
-                    <dt>Duracion</dt>
+                    <dt>Duración</dt>
                     <dd>{formatDuration(metadata.duration)}</dd>
+                  </>
+                ) : null}
+                {metadata.filesize ? (
+                  <>
+                    <dt>Tamaño estimado</dt>
+                    <dd>{formatBytes(metadata.filesize)}</dd>
                   </>
                 ) : null}
               </dl>
@@ -316,23 +438,26 @@ export default function App() {
           </div>
 
           <div className="quality-block">
-            <label htmlFor="quality">Calidad</label>
+            <div className="label-row">
+              <label htmlFor="quality">Calidad</label>
+              {quality === DEFAULT_QUALITY ? <span className="recommended-chip">Recomendada</span> : null}
+            </div>
             <select
               id="quality"
               value={quality}
               onChange={(event) => setQuality(event.target.value)}
               disabled={isBusy}
             >
-              {qualities.map((option) => (
+              {availableQualities.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
               ))}
             </select>
-            <p className="quality-hint">
-              {quality === "best"
-                ? "Mejor calidad puede tardar mas."
-                : "Para descargas mas rapidas en celular, 720p suele ser suficiente."}
+            <p
+              className={`quality-hint ${["best", "mp3"].includes(quality) ? "is-warning" : ""}`}
+            >
+              {getQualityHint(quality)}
             </p>
           </div>
 
@@ -340,108 +465,148 @@ export default function App() {
             className="primary-button full-width"
             type="button"
             onClick={handleStartDownload}
-            disabled={isBusy || viewState === "done"}
+            disabled={isBusy || ["done", "delivered"].includes(viewState)}
           >
-            {viewState === "downloading" ? "Descargando..." : "Descargar"}
+            {viewState === "downloading"
+              ? "Descargando..."
+              : getDownloadButtonLabel(quality)}
           </button>
         </section>
       ) : null}
 
-      {job ? (
-        <section className="progress-panel" aria-live="polite">
-          <div className="progress-header">
-            <span>{job.phaseLabel || job.message || "Procesando..."}</span>
-            <strong>{job.progress || 0}%</strong>
-          </div>
-          <div className="progress-track">
-            <div
-              className={`progress-bar ${job.downloadPercent == null && viewState === "downloading" ? "is-indeterminate" : ""}`}
-              style={{ width: `${job.progress || 0}%` }}
-            />
-          </div>
-          <p className="progress-message">{job.message || "Procesando..."}</p>
-          <dl className="download-stats">
-            {job.speed ? (
-              <>
-                <dt>Velocidad</dt>
-                <dd>{job.speed}</dd>
-              </>
-            ) : null}
-            {job.eta ? (
-              <>
-                <dt>ETA</dt>
-                <dd>{job.eta}</dd>
-              </>
-            ) : null}
-            {job.downloadedBytes ? (
-              <>
-                <dt>Datos</dt>
-                <dd>
-                  {formatBytes(job.downloadedBytes)}
-                  {job.totalBytes ? ` / ${formatBytes(job.totalBytes)}` : ""}
-                </dd>
-              </>
-            ) : null}
-            {job.currentFile ? (
-              <>
-                <dt>Archivo</dt>
-                <dd>{job.currentFile}</dd>
-              </>
-            ) : null}
-          </dl>
-          {viewState === "done" ? (
-            <button
-              className="primary-button full-width"
-              type="button"
-              onClick={handleSaveFile}
-              disabled={isSaving}
-            >
-              {isSaving ? "Preparando..." : "Guardar archivo"}
-            </button>
-          ) : null}
-        </section>
+      {visibleJob ? (
+        <ProgressPanel
+          job={visibleJob}
+          viewState={viewState}
+          isSaving={isSaving}
+          onSave={handleSaveFile}
+        />
       ) : null}
 
-      {notice ? <p className="notice-text">{notice}</p> : null}
-      {error ? <p className="error-text">{error}</p> : null}
+      {notice ? (
+        <p className="notice-text" role="status">
+          {notice}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      ) : null}
     </main>
   );
 }
 
-function formatBytes(value) {
-  const size = Number(value);
-  if (!Number.isFinite(size) || size <= 0) {
-    return "";
-  }
-  const units = ["B", "KB", "MB", "GB"];
-  let current = size;
-  let unit = 0;
-  while (current >= 1024 && unit < units.length - 1) {
-    current /= 1024;
-    unit += 1;
-  }
-  return unit === 0 ? `${Math.round(current)} ${units[unit]}` : `${current.toFixed(1)} ${units[unit]}`;
-}
+function ProgressPanel({ job, viewState, isSaving, onSave }) {
+  const phaseLabel = getPhaseLabel(job);
+  const progress = getProgressValue(job);
+  const downloadPercent = getDownloadPercent(job);
+  const isTransfer = TRANSFER_PHASES.has(job.phase);
+  const isIndeterminate =
+    viewState === "analyzing" ||
+    (viewState === "downloading" && !(isTransfer && downloadPercent != null));
+  const hasData = job.downloadedBytes != null || job.totalBytes != null;
+  const filename = job.currentFile || job.filename;
 
-function formatApiMessage(message) {
-  if (isYoutubeVerificationMessage(message)) {
-    return "YouTube está pidiendo verificación. Esta app necesita cookies de YouTube configuradas en Render para este video.";
-  }
-  return message;
-}
+  return (
+    <section
+      className="progress-panel"
+      aria-labelledby="progress-title"
+      aria-busy={["analyzing", "downloading"].includes(viewState)}
+    >
+      <div className="progress-header" aria-live="polite" aria-atomic="true">
+        <div>
+          <p className="progress-kicker">Fase actual</p>
+          <h2 id="progress-title">{phaseLabel}</h2>
+        </div>
+        {isIndeterminate ? (
+          <strong className="progress-percent">En curso</strong>
+        ) : job.progress != null ? (
+          <strong className="progress-percent">{progress}%</strong>
+        ) : null}
+      </div>
 
-function isYoutubeVerificationMessage(message) {
-  return /youtube.*(verificaci[oó]n|no-bot|cookies)/i.test(message || "");
-}
+      <div
+        className="progress-track"
+        role="progressbar"
+        aria-label={`Progreso: ${phaseLabel}`}
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={isIndeterminate ? undefined : progress}
+        aria-valuetext={isIndeterminate ? `${phaseLabel}, en curso` : `${progress}%`}
+      >
+        <div
+          className={`progress-bar ${isIndeterminate ? "is-indeterminate" : ""}`}
+          style={isIndeterminate ? undefined : { width: `${progress}%` }}
+        />
+      </div>
 
-function formatDuration(seconds) {
-  const total = Number(seconds);
-  if (!Number.isFinite(total) || total <= 0) {
-    return "";
-  }
-  const minutes = Math.floor(total / 60);
-  const remaining = Math.floor(total % 60)
-    .toString()
-    .padStart(2, "0");
-  return `${minutes}:${remaining}`;
+      <div className="progress-copy">
+        {job.step && job.stepsTotal ? (
+          <span className="step-chip">
+            Paso {Math.min(job.step, job.stepsTotal)} de {job.stepsTotal}
+          </span>
+        ) : null}
+        <p className="progress-message">{job.message || `${phaseLabel}...`}</p>
+      </div>
+
+      {isTransfer || hasData || job.speed || job.eta || filename ? (
+        <dl className="download-stats">
+          {isTransfer ? (
+            <>
+              <dt>Descarga</dt>
+              <dd>
+                {downloadPercent == null ? "Calculando porcentaje..." : `${downloadPercent.toFixed(1)}%`}
+              </dd>
+              <dt>Velocidad</dt>
+              <dd>{job.speed || "Calculando..."}</dd>
+              <dt>Tiempo restante</dt>
+              <dd>{job.eta || "Calculando..."}</dd>
+            </>
+          ) : null}
+          {isTransfer || hasData ? (
+            <>
+              <dt>Datos</dt>
+              <dd>
+                {hasData ? formatBytes(job.downloadedBytes || 0) : "Calculando tamaño..."}
+                {hasData && job.totalBytes ? ` / ${formatBytes(job.totalBytes)}` : ""}
+                {hasData && !job.totalBytes ? " descargados" : ""}
+              </dd>
+            </>
+          ) : null}
+          {filename ? (
+            <>
+              <dt>Archivo actual</dt>
+              <dd>{filename}</dd>
+            </>
+          ) : null}
+        </dl>
+      ) : null}
+
+      {viewState === "done" ? (
+        <div className="ready-card">
+          <strong>Tu archivo está listo para guardar.</strong>
+          <p>
+            El botón funciona una sola vez. Al entregar el archivo, el servidor elimina su copia
+            temporal.
+          </p>
+          <button
+            className="primary-button full-width"
+            type="button"
+            onClick={onSave}
+            disabled={isSaving}
+          >
+            {isSaving ? "Preparando entrega..." : "Guardar archivo (una sola vez)"}
+          </button>
+        </div>
+      ) : null}
+
+      {viewState === "delivered" ? (
+        <div className="delivered-card" role="status">
+          <strong>Archivo entregado.</strong>
+          <p>La copia temporal fue eliminada. Para guardarlo otra vez, generá una nueva descarga.</p>
+        </div>
+      ) : null}
+    </section>
+  );
 }

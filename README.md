@@ -1,230 +1,274 @@
-# Private Media Downloader
+# Polivalent Media Downloader
 
-Mini web privada para descargar contenido publico permitido desde YouTube, TikTok, Instagram y X/Twitter. Usa FastAPI, React/Vite, yt-dlp y ffmpeg. No usa base de datos ni disco persistente.
+Aplicación web privada para guardar videos desde el celular mediante un link. Usa FastAPI, React/Vite, yt-dlp, ffmpeg y un runtime Node compatible con el solver EJS de YouTube.
 
-Usala solo con contenido propio, publico o que tengas permiso de guardar. No intenta saltar DRM, paywalls, contenido privado, login obligatorio ni restricciones de acceso.
+La aplicación está pensada para contenido público, contenido propio o contenido que una cuenta autorizada pueda ver legítimamente con sus propias cookies. No intenta evadir DRM, paywalls, acceso privado no autorizado ni restricciones legales.
 
-## Que hace
+## Compatibilidad y límites de seguridad
 
-- Login con `APP_PASSWORD`.
-- Analisis de metadata sin descargar archivos.
-- Limpieza automatica de URLs de YouTube con parametros de playlist/radio/share cuando contienen un video individual.
-- Selector de calidad: mejor compatible, 1080p, 720p, 480p o MP3.
-- Progreso detallado con fase, velocidad, ETA y bytes cuando `yt-dlp` los reporta.
-- Descarga en una carpeta temporal unica bajo `/tmp/media-downloads`.
-- Entrega el archivo como attachment.
-- Borra el archivo y la carpeta temporal despues de entregarlo.
-- Expira temporales viejos cada 5 minutos.
-- Mantiene solo estado temporal en memoria, sin historial permanente.
+La allowlist admite estas plataformas:
+
+- YouTube: `youtube.com`, `www.youtube.com`, `m.youtube.com`, `music.youtube.com` y `youtu.be`.
+- TikTok: `tiktok.com`, `www.tiktok.com`, `vm.tiktok.com` y `vt.tiktok.com`.
+- Instagram: `instagram.com` y `www.instagram.com`.
+- X/Twitter: `x.com`, `www.x.com`, `twitter.com` y `www.twitter.com`.
+
+Sólo se aceptan enlaces HTTPS. Los links de YouTube con un video individual se normalizan a `https://www.youtube.com/watch?v=VIDEO_ID`; se eliminan parámetros como `list`, `index`, `start_radio`, `si`, `pp` y `feature`. También se aceptan Shorts y `youtu.be`. Una playlist sin `v` se rechaza y yt-dlp siempre usa `noplaylist`. En las demás plataformas se eliminan query strings y fragmentos de tracking antes de llamar a yt-dlp.
+
+No se habilitan sitios genéricos. Aunque yt-dlp los soporte, validar únicamente el dominio inicial no impide que un redirect o DNS rebinding alcance una IP privada. Mantener la allowlist cerrada evita convertir el servidor en un vector SSRF.
+
+## Descargas temporales de único uso
+
+- No hay base de datos, historial ni biblioteca.
+- Cada trabajo recibe un ID aleatorio y una carpeta con permisos privados bajo `/tmp/media-downloads`.
+- Se admiten hasta tres trabajos pendientes o listos a la vez; el worker procesa uno por vez para no saturar el servidor gratuito.
+- El archivo se entrega como attachment por streaming directo, sin copiarlo completo a la RAM del teléfono, y no admite rangos parciales.
+- La primera entrega consume el archivo; un segundo intento responde `410 Gone` mientras el job siga registrado.
+- Cancelar o borrar un trabajo elimina sus parciales.
+- Los fallos y timeouts limpian la carpeta temporal.
+- El cleanup periódico elimina trabajos y carpetas huérfanas vencidas.
+- No se debe agregar Persistent Disk en Render.
+
+Si el cliente corta la conexión antes de completar la entrega, el cleanup periódico funciona como red de seguridad.
 
 ## Variables de entorno
 
-Copiá `.env.example` a `.env` y ajustá:
+Copiá `.env.example` a `.env` y reemplazá los valores de ejemplo.
 
-```bash
-APP_PASSWORD=cambia-esta-contrasena
-APP_SECRET_KEY=cambia-esta-clave-para-firmar-tokens
+| Variable | Default | Uso |
+| --- | --- | --- |
+| `APP_PASSWORD` | sólo local: contraseña de desarrollo | Obligatoria en producción. Usá una contraseña aleatoria y larga. |
+| `APP_SECRET_KEY` | `APP_PASSWORD` | Clave para firmar sesiones. En producción conviene una clave aleatoria distinta de al menos 32 bytes. |
+| `SESSION_TTL_SECONDS` | `86400` | Duración de la sesión. |
+| `MAX_FILE_MB` | `500` | Tamaño máximo estimado y final. |
+| `DOWNLOAD_TTL_MINUTES` | `15` | Antigüedad máxima de jobs y temporales. |
+| `DOWNLOAD_TIMEOUT_SECONDS` | `600` | Límite cooperativo por fase de metadata/descarga; se combina con timeouts de socket y reintentos acotados. |
+| `YTDLP_SOCKET_TIMEOUT_SECONDS` | `20` | Timeout de red por operación de yt-dlp. |
+| `DOWNLOAD_BASE_DIR` | `/tmp/media-downloads` | Carpeta efímera. No apuntar a un disco persistente en Render. |
+| `ALLOWED_ORIGINS` | vacío | Orígenes CORS separados por coma. Para el frontend servido por la misma app puede quedar vacío. |
+| `PORT` | `8000` | Puerto HTTP. Render lo define automáticamente. |
+| `ENVIRONMENT` | `development` | Usar `production` en Render. |
+| `YOUTUBE_COOKIES_ENABLED` | `false` | Activa cookies sólo para links de YouTube. |
+| `YOUTUBE_COOKIES_PATH` | vacío | Ruta del archivo Netscape en runtime. |
+| `YOUTUBE_COOKIES_FROM_BROWSER` | `none` | Sólo desarrollo local: `chrome`, `firefox`, `safari`, `edge` o `brave`. Se ignora en producción. |
+
+Configuración recomendada para Render:
+
+```text
+APP_PASSWORD=<contraseña-aleatoria-larga>
+APP_SECRET_KEY=<otra-clave-aleatoria-larga>
+SESSION_TTL_SECONDS=86400
 MAX_FILE_MB=500
 DOWNLOAD_TTL_MINUTES=15
 DOWNLOAD_TIMEOUT_SECONDS=600
-ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-PORT=8000
-ENVIRONMENT=development
-YOUTUBE_COOKIES_ENABLED=false
-YOUTUBE_COOKIES_PATH=
+YTDLP_SOCKET_TIMEOUT_SECONDS=20
+ENVIRONMENT=production
+YOUTUBE_COOKIES_ENABLED=true
+YOUTUBE_COOKIES_PATH=/etc/secrets/youtube-cookies.txt
 YOUTUBE_COOKIES_FROM_BROWSER=none
 ```
 
-En produccion, `APP_PASSWORD` es obligatoria. `APP_SECRET_KEY` es opcional, pero recomendado para firmar tokens con una clave distinta de la contrasena. En Render tambien conviene usar `ENVIRONMENT=production`.
+No agregues `DOWNLOAD_BASE_DIR` ni `PORT` en Render salvo que tengas un motivo concreto.
 
-## Correr local con Docker
+## Uso local con Docker
+
+Requisitos: Docker Desktop o Docker Engine con Compose.
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Abrí [http://localhost:8000](http://localhost:8000).
+Abrí [http://localhost:8000](http://localhost:8000). Desde un teléfono en la misma red, usá `http://IP-DE-TU-PC:8000`.
 
-Desde un celular en la misma red Wi-Fi, buscá la IP local de tu computadora y abrí:
-
-```text
-http://IP-DE-LA-PC:8000
-```
-
-En macOS podés probar:
+Para probar cookies en Docker sin copiarlas a la imagen:
 
 ```bash
-ipconfig getifaddr en0
+docker build -t polivalent-media-downloader .
+docker run --rm -p 8000:8000 --env-file .env \
+  -e YOUTUBE_COOKIES_ENABLED=true \
+  -e YOUTUBE_COOKIES_PATH=/run/secrets/youtube-cookies.txt \
+  -v "$PWD/youtube-cookies.txt:/run/secrets/youtube-cookies.txt:ro" \
+  polivalent-media-downloader
 ```
 
-## Correr local sin Docker
+En PowerShell, reemplazá `$PWD/youtube-cookies.txt` por la ruta absoluta del archivo. No montes `/tmp/media-downloads` como `tmpfs`: un video grande consumiría RAM. La capa escribible descartable del contenedor ya es almacenamiento efímero.
 
-Necesitás Python 3.12+, Node 20+ y ffmpeg instalado. Node tambien ayuda a `yt-dlp-ejs` para compatibilidad con YouTube.
+## Uso local sin Docker
+
+Necesitás Python 3.12+, Node 24+ y ffmpeg/ffprobe.
 
 ```bash
 cp .env.example .env
 
 cd frontend
-npm install
+npm ci
+npm run check
 npm run build
 
 cd ..
 rm -rf backend/static
 cp -R frontend/dist backend/static
 
-cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-APP_PASSWORD=tu-contrasena PORT=8000 uvicorn app.main:app --host 0.0.0.0 --port 8000
+pip install -r backend/requirements.txt
+APP_PASSWORD=tu-contraseña APP_SECRET_KEY=tu-clave \
+  uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Abrí [http://localhost:8000](http://localhost:8000).
+En Windows PowerShell, activá el entorno con `.venv\Scripts\Activate.ps1` y definí variables con `$env:APP_PASSWORD = "..."`.
 
-Para desarrollo frontend con Vite:
+## Cookies de YouTube
+
+Las cookies se leen sólo en runtime. No se copian durante el build, no se muestran en `/api/debug/system` y no deben entrar al repositorio.
+
+Usá preferentemente una cuenta secundaria: YouTube puede invalidar cookies o limitar una cuenta usada por automatización.
+
+Referencia: [guía oficial de yt-dlp para exportar cookies de YouTube](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies).
+
+### Exportar un archivo pequeño y válido
+
+1. Abrí una única ventana privada/incógnito.
+2. Iniciá sesión con la cuenta secundaria.
+3. En esa misma pestaña abrí `https://www.youtube.com/robots.txt`.
+4. Exportá sólo las cookies del sitio `youtube.com` en formato Mozilla/Netscape.
+5. Cerrá inmediatamente toda la ventana privada para que esa sesión no rote las cookies.
+6. Confirmá que la primera línea sea `# Netscape HTTP Cookie File` o `# HTTP Cookie File`.
+7. Verificá que el archivo sea menor a 500 KiB.
+
+macOS/Linux:
 
 ```bash
-cd backend
-APP_PASSWORD=tu-contrasena uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-cd ../frontend
-npm run dev
+wc -c youtube-cookies.txt
 ```
 
-Vite proxya `/api` y `/health` al backend local.
+PowerShell:
+
+```powershell
+(Get-Item .\youtube-cookies.txt).Length
+```
+
+El deploy auditado fallaba antes de ejecutar el Dockerfile con `secret ... too big. max size 500KiB`. Un export de todas las cookies del navegador puede superar ese límite; exportá únicamente las de YouTube.
+
+### Secret File exacto en Render
+
+En `Environment > Secret Files`:
+
+- Filename exacto: `youtube-cookies.txt`
+- Ruta en runtime: `/etc/secrets/youtube-cookies.txt`
+- Sin punto final, espacios, comillas ni prefijos de carpeta en el campo Filename.
+
+Después guardá los cambios y hacé `Manual Deploy > Deploy latest commit`. El archivo no existe durante el build Docker; Render lo monta en runtime. Si falta o no es legible, la app inicia igual y reporta `youtubeCookiesReadable=false`.
+
+Referencia: [Secret Files en Render](https://render.com/docs/configure-environment-variables#secret-files).
+
+## Diagnóstico seguro
+
+`GET /api/debug/system` siempre requiere un Bearer token válido. La respuesta no incluye cookies, claves, rutas absolutas ni tokens. Informa:
+
+- versión de yt-dlp;
+- disponibilidad de ffmpeg, ffprobe, Node y Deno, más versión y compatibilidad de Node 22+;
+- si el almacenamiento temporal está listo y es efímero;
+- límites de tamaño y timeout;
+- ambiente;
+- `youtubeCookiesEnabled`, `youtubeCookiesConfigured`, `youtubeCookiesReadable` y `youtubeCookiesMode`.
+
+Ejemplo:
+
+```bash
+curl -sS https://TU-SERVICIO.onrender.com/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"TU_APP_PASSWORD"}'
+```
+
+Copiá el valor `token` de la respuesta y consultá:
+
+```bash
+curl -sS https://TU-SERVICIO.onrender.com/api/debug/system \
+  -H 'Authorization: Bearer TU_TOKEN'
+```
+
+Resultados esperados con el Secret File correcto:
+
+```json
+{
+  "ffmpegAvailable": true,
+  "ffprobeAvailable": true,
+  "nodeAvailable": true,
+  "nodeVersion": "24.0.0",
+  "nodeSupported": true,
+  "tempStorageReady": true,
+  "tempStorageEphemeral": true,
+  "youtubeCookiesEnabled": true,
+  "youtubeCookiesConfigured": true,
+  "youtubeCookiesReadable": true,
+  "youtubeCookiesMode": "file"
+}
+```
 
 ## Deploy en Render
 
-1. Subí este proyecto a GitHub.
-2. En Render, creá un nuevo Web Service.
-3. Elegí el repo y seleccioná Docker como runtime.
-4. No agregues Persistent Disk.
-5. Configurá variables:
+1. Runtime: Docker.
+2. Branch: `main`.
+3. Root Directory: vacío.
+4. Dockerfile Path: `./Dockerfile`.
+5. Docker Build Context Directory: `.`.
+6. Docker Command: vacío, para usar el `CMD` de la imagen.
+7. Health Check Path: `/health`.
+8. Auto-Deploy: `On Commit`.
+9. Persistent Disk: ninguno.
+10. Variables y Secret File: según las secciones anteriores.
 
-```text
-APP_PASSWORD=una-contrasena-larga
-APP_SECRET_KEY=otra-clave-larga
-MAX_FILE_MB=500
-DOWNLOAD_TTL_MINUTES=15
-DOWNLOAD_TIMEOUT_SECONDS=600
-ENVIRONMENT=production
-YOUTUBE_COOKIES_ENABLED=false
-```
+La imagen construye el frontend, instala ffmpeg/ffprobe, usa Python 3.12 y copia Node 24 al runtime. `yt-dlp[default,curl-cffi]` instala la versión compatible de `yt-dlp-ejs`; no se instala `yt-dlp-ejs` por separado.
 
-Render define `PORT` automaticamente. El backend escucha en `0.0.0.0` y usa esa variable.
-
-La imagen Docker instala `ffmpeg`, `ffprobe`, `nodejs`, `yt-dlp[default,curl-cffi]` y `yt-dlp-ejs` en runtime. No usa cookies ni login por defecto.
-
-## YouTube en Render: configurar cookies
-
-Si YouTube responde `Sign in to confirm you're not a bot` desde Render, podés configurar cookies propias de YouTube como Secret File. Usá esto solo para contenido al que tu cuenta pueda acceder normalmente. No sirve para DRM, paywalls ni contenido inaccesible para esa cuenta.
-
-Recomendacion fuerte: usá una cuenta secundaria de Google/YouTube, no tu cuenta principal.
-
-1. Exportá un `cookies.txt` de YouTube en formato Netscape desde un navegador donde esa cuenta secundaria esté logueada.
-2. No commitees ese archivo.
-3. No lo subas al repo.
-4. En Render, entrá al servicio.
-5. Abrí `Environment`.
-6. En `Secret Files`, elegí `Add Secret File`.
-7. Usá `youtube-cookies.txt` como filename.
-8. Pegá el contenido completo del `cookies.txt`.
-9. Agregá estas variables:
-
-```text
-YOUTUBE_COOKIES_ENABLED=true
-YOUTUBE_COOKIES_PATH=/etc/secrets/youtube-cookies.txt
-YOUTUBE_COOKIES_FROM_BROWSER=none
-```
-
-10. Redeployá el servicio.
-
-Las cookies pueden expirar o quedar invalidadas. Si YouTube vuelve a rechazar la descarga, exportá cookies nuevas, actualizá el Secret File y redeployá. Si YouTube cambia sus protecciones, puede seguir fallando aun con cookies.
-
-Para desarrollo local sin Docker podés usar cookies del navegador local:
-
-```bash
-YOUTUBE_COOKIES_ENABLED=true
-YOUTUBE_COOKIES_FROM_BROWSER=chrome
-```
-
-En Docker local es mejor montar un `youtube-cookies.txt` como volumen y apuntar `YOUTUBE_COOKIES_PATH` a esa ruta dentro del contenedor.
+Referencia: [requisitos actuales del solver EJS de yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 
 ## Actualizar yt-dlp
 
-Con Docker, reconstruí la imagen:
+Las dependencias principales de producción están fijadas para evitar actualizaciones directas inesperadas; las transitivas se resuelven durante el build y deben volver a auditarse. Para actualizar yt-dlp:
 
-```bash
-docker compose build --no-cache
-docker compose up
-```
+1. Cambiá sólo el pin `yt-dlp[default,curl-cffi]==...` en `backend/requirements.txt`.
+2. Ejecutá los tests y el build Docker.
+3. Confirmá dentro del contenedor las versiones de yt-dlp, Node, ffmpeg y ffprobe.
+4. Commiteá y redeployá.
 
-Sin Docker:
-
-```bash
-cd backend
-source .venv/bin/activate
-pip install -U yt-dlp
-```
-
-En Render, hacé un nuevo deploy para que la imagen instale la version disponible de `yt-dlp`.
-
-Si YouTube cambia algo y empieza a fallar, forzá un redeploy o un deploy manual desde Render para reconstruir la imagen e instalar una version nueva de `yt-dlp`. Las cookies de YouTube son opcionales y deben configurarse como Secret File, nunca en el repo.
-
-## Debug seguro
-
-`GET /api/debug/system` devuelve informacion de runtime sin secretos:
-
-- version de `yt-dlp`
-- disponibilidad de `ffmpeg` y `ffprobe`
-- disponibilidad de Node/Deno para `yt-dlp-ejs`
-- carpeta temporal
-- limites de tamano y timeout
-- entorno
-- estado de cookies de YouTube: `youtubeCookiesEnabled`, `youtubeCookiesConfigured`, `youtubeCookiesReadable`, `youtubeCookiesMode`
-
-En produccion requiere `Authorization: Bearer <token>`.
+No fijes `yt-dlp-ejs` manualmente: el extra `default` resuelve la versión compatible.
 
 ## QA local
 
-Backend:
-
 ```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-cd ..
+python3 -m compileall -q backend
+python3 -m pip install -r backend/requirements-dev.txt
 pytest -q
-```
 
-Frontend:
-
-```bash
 cd frontend
-npm install
+npm ci
+npm run check
 npm run build
+
+cd ..
+git diff --check
+docker build -t polivalent-media-downloader .
 ```
 
-Docker, si Docker Desktop esta corriendo:
+Con el contenedor levantado:
 
 ```bash
-docker compose build
-docker compose up
+curl -f http://127.0.0.1:8000/health
 ```
 
-## Descargas temporales de unico uso
+## Errores esperables
 
-Cada descarga crea un `jobId` aleatorio y una carpeta propia en `/tmp/media-downloads`. Cuando el usuario guarda el archivo, el backend responde con el attachment y luego elimina la carpeta con una tarea de fondo. Si se intenta usar otra vez el mismo `jobId`, la API responde `410 Gone`.
+- Cookies ausentes: la app sigue viva; YouTube explica cómo configurarlas.
+- Cookies vencidas o rechazadas: exportá cookies nuevas y redeployá.
+- Verificación no-bot/login: configurá cookies propias de YouTube.
+- DRM, paywall o privado sin autorización: no se descarga.
+- Restricción regional, de edad o de cuenta: puede seguir fallando aunque existan cookies.
+- Instagram, TikTok y X cambian con frecuencia y pueden exigir login o bloquear IPs de datacenter.
+- Algunos formatos requieren ffmpeg para unir audio y video; MP3 tarda más porque convierte audio.
+- `best` puede tardar y pesar bastante más que 720p.
+- Render Free puede dormirse y demorar el primer request.
+- El timeout de aplicación se controla antes, después y durante el progreso de yt-dlp. Una operación nativa de ffmpeg o red que no emita callbacks puede demorar en responder a la cancelación hasta que finalice su timeout interno.
 
-Si la descarga falla, se limpia la carpeta parcial. Si se cierra la pagina o se corta la conexion, el cleanup automatico elimina temporales con mas de `DOWNLOAD_TTL_MINUTES`.
-
-## Limitaciones
-
-- Algunas plataformas pueden cambiar y romper temporalmente `yt-dlp`.
-- Instagram o X/Twitter pueden requerir acceso especial para ciertos contenidos.
-- Render Free puede dormirse y tardar en despertar.
-- Videos grandes dependen del tamano, la red y el servidor.
-- MP3 puede tardar mas porque requiere conversion.
-- No hay historial: si se cierra la pagina, hay que generar la descarga otra vez.
+No existe garantía de que un extractor externo continúe funcionando después de cambios de la plataforma. Actualizá yt-dlp y conservá mensajes de error seguros, sin desactivar las barreras legales o de red.

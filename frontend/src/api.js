@@ -46,29 +46,26 @@ export async function cancelJob(jobId, token) {
   });
 }
 
-export async function downloadFile(jobId, token) {
-  const response = await fetch(`${API_BASE}/api/files/${encodeURIComponent(jobId)}`, {
-    headers: authHeaders(token),
+export async function authorizeFileDownload(jobId, token) {
+  const result = await request(`/api/files/${encodeURIComponent(jobId)}/authorize`, {
+    method: "POST",
+    token,
   });
-
-  if (!response.ok) {
-    throw new ApiError(await readError(response), response.status);
+  if (!result?.downloadUrl) {
+    throw new ApiError("El servidor no pudo preparar la entrega del archivo.", 500);
   }
-
-  const disposition = response.headers.get("content-disposition") || "";
-  const filename = parseFilename(disposition) || "media-download";
-  const blob = await response.blob();
-  return { blob, filename };
+  return resolveDownloadUrl(result.downloadUrl, window.location.origin);
 }
 
 async function request(path, { method, body, token }) {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetchFromApi(`${API_BASE}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
       ...authHeaders(token),
     },
     body: body ? JSON.stringify(body) : undefined,
+    cache: "no-store",
   });
 
   if (!response.ok) {
@@ -76,6 +73,20 @@ async function request(path, { method, body, token }) {
   }
 
   return response.json();
+}
+
+async function fetchFromApi(path, options) {
+  try {
+    return await fetch(path, options);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new ApiError(
+        "No se pudo conectar con el servidor. Revisá tu conexión e intentá de nuevo.",
+        0,
+      );
+    }
+    throw error;
+  }
 }
 
 function authHeaders(token) {
@@ -91,11 +102,16 @@ async function readError(response) {
   }
 }
 
-function parseFilename(disposition) {
-  const utfMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utfMatch) {
-    return decodeURIComponent(utfMatch[1]);
+export function resolveDownloadUrl(downloadUrl, origin) {
+  const expectedOrigin = new URL(origin).origin;
+  const resolved = new URL(downloadUrl, expectedOrigin);
+  if (
+    resolved.origin !== expectedOrigin ||
+    !/^\/api\/files\/[A-Za-z0-9_-]+$/.test(resolved.pathname) ||
+    resolved.search ||
+    resolved.hash
+  ) {
+    throw new ApiError("El servidor devolvió una URL de entrega no válida.", 500);
   }
-  const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
-  return asciiMatch ? asciiMatch[1] : null;
+  return resolved.href;
 }

@@ -28,7 +28,10 @@ def test_health_and_security_headers(client):
     assert response.status_code == 200
     assert response.json() == {"ok": True, "status": "healthy"}
     assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "no-referrer"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert "camera=()" in response.headers["permissions-policy"]
 
 
 def test_login_success_failure_and_rate_limit(client):
@@ -43,6 +46,16 @@ def test_login_success_failure_and_rate_limit(client):
         client.post("/api/auth/login", json={"password": "wrong"})
     limited = client.post("/api/auth/login", json={"password": "wrong"})
     assert limited.status_code == 429
+    assert 1 <= int(limited.headers["retry-after"]) <= 300
+    assert limited.headers["cache-control"] == "no-store"
+
+
+def test_invalid_login_body_never_echoes_password(client):
+    secret_value = "not-a-real-secret-" + ("x" * 600)
+    response = client.post("/api/auth/login", json={"password": secret_value})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "La solicitud no es valida."}
+    assert secret_value not in response.text
 
 
 def test_protected_endpoints_reject_missing_or_invalid_token(client):
@@ -55,6 +68,13 @@ def test_protected_endpoints_reject_missing_or_invalid_token(client):
         headers=auth_headers("bad-token"),
     )
     assert invalid.status_code == 401
+
+
+def test_unknown_api_get_is_json_404_instead_of_spa(client):
+    response = client.get("/api/not-a-real-endpoint")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Endpoint de API no encontrado."}
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_cors_preflight_for_allowed_origin(client):
@@ -107,7 +127,7 @@ def test_info_validates_urls_and_returns_mocked_metadata(client, token, monkeypa
 
     playlist = client.post(
         "/api/info",
-        json={"url": "https://www.youtube.com/watch?v=abc123&list=PL123"},
+        json={"url": "https://www.youtube.com/watch?v=m4Be0hRQGIs&list=PL123"},
         headers=auth_headers(token),
     )
     assert playlist.status_code == 200
@@ -186,6 +206,7 @@ def test_download_file_is_one_use_and_temp_dir_is_removed(client, token, monkeyp
                 "eta": "00:18",
                 "downloadedBytes": 12345678,
                 "totalBytes": 98765432,
+                "currentFile": "clip.f140.m4a",
                 "message": "Descargando video...",
                 "step": 4,
                 "stepsTotal": 5,
@@ -208,8 +229,19 @@ def test_download_file_is_one_use_and_temp_dir_is_removed(client, token, monkeyp
     assert done["progress"] == 100
     assert done["phase"] == "done"
     assert done["filename"] == "clip.mp4"
+    assert done["currentFile"] == "clip.mp4"
+    assert done["downloadedBytes"] == len(b"video-bytes")
+    assert done["totalBytes"] == len(b"video-bytes")
 
     job_dir = main_module.job_manager._jobs[job_id].temp_dir
+    ranged_file = client.get(
+        f"/api/files/{job_id}",
+        headers={**auth_headers(token), "Range": "bytes=0-2"},
+    )
+    assert ranged_file.status_code == 416
+    assert ranged_file.headers["accept-ranges"] == "none"
+    assert job_dir.exists()
+
     first_file = client.get(f"/api/files/{job_id}", headers=auth_headers(token))
     assert first_file.status_code == 200
     assert first_file.content == b"video-bytes"
@@ -239,6 +271,14 @@ def test_delete_job_cancels_and_removes_temp_dir(client, token, monkeypatch):
         )
         while not check_cancelled():
             time.sleep(0.01)
+        progress_callback(
+            {
+                "status": "downloading",
+                "phase": "downloading_video",
+                "progress": 99,
+                "message": "Este progreso tardio debe ignorarse.",
+            }
+        )
         raise DownloadCancelled()
 
     monkeypatch.setattr(jobs_module, "download_media", slow_download_media)
@@ -255,6 +295,9 @@ def test_delete_job_cancels_and_removes_temp_dir(client, token, monkeypatch):
     assert deleted.status_code == 200
     job.future.result(timeout=2)
     assert job.status == "expired"
+    snapshot = client.get(f"/api/jobs/{job_id}", headers=auth_headers(token))
+    assert snapshot.status_code == 200
+    assert snapshot.json()["status"] == "expired"
     assert not job.temp_dir.exists()
 
 
@@ -279,15 +322,23 @@ def test_download_timeout_becomes_safe_error(client, token, monkeypatch):
     assert "tardó demasiado" in status["message"]
 
 
-def test_debug_system_requires_no_secret_and_reports_runtime(client):
-    response = client.get("/api/debug/system")
+def test_debug_system_requires_auth_and_reports_runtime_without_paths(client, token):
+    missing_auth = client.get("/api/debug/system")
+    assert missing_auth.status_code == 401
+
+    response = client.get("/api/debug/system", headers=auth_headers(token))
     assert response.status_code == 200
     payload = response.json()
     assert "ytDlpVersion" in payload
     assert "ffmpegAvailable" in payload
     assert "ffprobeAvailable" in payload
     assert "nodeAvailable" in payload
+    assert "nodeVersion" in payload
+    assert "nodeSupported" in payload
     assert "denoAvailable" in payload
+    assert payload["tempStorageReady"] is True
+    assert payload["tempStorageEphemeral"] is True
+    assert "tempDir" not in payload
     assert payload["youtubeCookiesEnabled"] is False
     assert payload["youtubeCookiesConfigured"] is False
     assert payload["youtubeCookiesReadable"] is False

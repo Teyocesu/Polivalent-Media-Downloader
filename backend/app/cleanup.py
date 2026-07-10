@@ -14,5 +14,5 @@ async def cleanup_loop(manager: JobManager, interval_seconds: int = 300) -> None
             await asyncio.to_thread(manager.cleanup_expired)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Temporary download cleanup failed")
+        except Exception as exc:
+            logger.error("Temporary download cleanup failed error_type=%s", type(exc).__name__)

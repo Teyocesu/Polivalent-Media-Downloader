@@ -31,6 +31,7 @@ def make_settings(tmp_path, max_file_mb=1, ttl_minutes=1):
             "youtube.com",
             "www.youtube.com",
             "m.youtube.com",
+            "music.youtube.com",
             "youtu.be",
             "tiktok.com",
             "www.tiktok.com",
@@ -58,6 +59,25 @@ def test_app_password_is_required_in_production(monkeypatch):
 
     monkeypatch.setenv("APP_PASSWORD", "test-password")
     monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("APP_SECRET_KEY", "test-secret")
+    get_settings.cache_clear()
+
+
+def test_whitespace_password_is_rejected_and_blank_secret_falls_back(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("APP_PASSWORD", "   ")
+    monkeypatch.setenv("APP_SECRET_KEY", "   ")
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="APP_PASSWORD"):
+        get_settings()
+
+    monkeypatch.setenv("APP_PASSWORD", "strong-production-password")
+    get_settings.cache_clear()
+    assert get_settings().token_secret == "strong-production-password"
+
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("APP_PASSWORD", "test-password")
+    monkeypatch.setenv("APP_SECRET_KEY", "test-secret")
     get_settings.cache_clear()
 
 
@@ -102,9 +122,17 @@ def test_normalize_youtube_url_variants(tmp_path):
     assert normalize_url("https://m.youtube.com/watch?v=m4Be0hRQGIs&feature=share") == (
         "https://www.youtube.com/watch?v=m4Be0hRQGIs"
     )
+    assert normalize_url("https://music.youtube.com/watch?v=m4Be0hRQGIs&list=RD123") == (
+        "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    )
     assert normalize_url("https://www.youtube.com/shorts/m4Be0hRQGIs?si=abc") == (
         "https://www.youtube.com/watch?v=m4Be0hRQGIs"
     )
+    assert normalize_url(
+        "https://www.youtube.com/shorts/m4Be0hRQGIs?list=PLignored&index=2"
+    ) == "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    with pytest.raises(UserFacingError):
+        normalize_url("https://youtu.be/m4Be0hRQGIs%0Aattacker")
     with pytest.raises(UserFacingError, match="playlist"):
         normalize_url("https://www.youtube.com/playlist?list=PL123")
 
@@ -125,7 +153,9 @@ def test_size_limits_and_format_options(tmp_path):
     assert mp3["postprocessors"][0]["preferredcodec"] == "mp3"
 
     selector_720 = _download_options("720", tmp_path, settings, lambda data: None, lambda data: None)
-    assert "height<=720" in selector_720["format"]
+    assert "height<=?720" in selector_720["format"]
+    assert all("height<=?720" in alternative for alternative in selector_720["format"].split("/"))
+    assert "max_filesize" not in selector_720
 
 
 def test_youtube_cookie_file_options(tmp_path):
@@ -157,14 +187,16 @@ def test_youtube_cookie_file_options(tmp_path):
         }
     )
     assert get_youtube_cookie_status(configured)["readable"] is True
-    assert get_youtube_cookie_options(configured) == {"cookiefile": str(cookie_file)}
+    configured_options = get_youtube_cookie_options(configured)
+    assert set(configured_options) == {"cookiefile"}
+    assert configured_options["cookiefile"].read().startswith("# Netscape HTTP Cookie File")
 
     metadata_options = _metadata_options(
         configured,
         {"debug_code": "default", "options": {}},
         "https://www.youtube.com/watch?v=m4Be0hRQGIs",
     )
-    assert metadata_options["cookiefile"] == str(cookie_file)
+    assert metadata_options["cookiefile"].read().startswith("# Netscape HTTP Cookie File")
 
     download_options = _download_options(
         "720",
@@ -174,7 +206,7 @@ def test_youtube_cookie_file_options(tmp_path):
         lambda data: None,
         url="https://www.youtube.com/watch?v=m4Be0hRQGIs",
     )
-    assert download_options["cookiefile"] == str(cookie_file)
+    assert download_options["cookiefile"].read().startswith("# Netscape HTTP Cookie File")
 
     x_options = _download_options(
         "720",
@@ -216,7 +248,12 @@ def test_error_mapping():
 def test_youtube_no_bot_error_mapping(tmp_path):
     no_cookies = make_settings(tmp_path)
     no_bot = DownloadError("Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies")
-    assert "cookies de YouTube" in _map_ytdlp_error(no_bot, no_cookies).message
+    youtube_url = "https://www.youtube.com/watch?v=m4Be0hRQGIs"
+    assert "cookies de YouTube" in _map_ytdlp_error(
+        no_bot,
+        no_cookies,
+        url=youtube_url,
+    ).message
 
     enabled_missing = Settings(
         **{
@@ -225,7 +262,11 @@ def test_youtube_no_bot_error_mapping(tmp_path):
             "youtube_cookies_path": tmp_path / "missing.txt",
         }
     )
-    assert "archivo no existe" in _map_ytdlp_error(no_bot, enabled_missing).message
+    assert "archivo no existe" in _map_ytdlp_error(
+        no_bot,
+        enabled_missing,
+        url=youtube_url,
+    ).message
 
     cookie_file = tmp_path / "youtube-cookies.txt"
     cookie_file.write_text("# Netscape HTTP Cookie File\n")
@@ -236,7 +277,18 @@ def test_youtube_no_bot_error_mapping(tmp_path):
             "youtube_cookies_path": cookie_file,
         }
     )
-    assert "rechazó" in _map_ytdlp_error(no_bot, enabled_readable).message
+    assert "rechazó" in _map_ytdlp_error(
+        no_bot,
+        enabled_readable,
+        url=youtube_url,
+    ).message
+
+    x_error = _map_ytdlp_error(
+        no_bot,
+        no_cookies,
+        url="https://x.com/example/status/123456",
+    )
+    assert "cookies de YouTube" not in x_error.message
 
 
 def test_sanitize_filename(tmp_path):
@@ -278,7 +330,17 @@ def test_cleanup_expires_old_jobs_and_orphan_dirs(tmp_path):
 
         manager.cleanup_expired()
         assert job.status == "expired"
+        assert manager.get_snapshot(job.job_id) is None
         assert not old_dir.exists()
         assert not orphan.exists()
     finally:
         manager.shutdown()
+
+
+def test_job_manager_rejects_unusable_download_base(tmp_path):
+    unusable = tmp_path / "not-a-directory"
+    unusable.write_text("file")
+    settings = Settings(**{**make_settings(tmp_path).__dict__, "download_base_dir": unusable})
+
+    with pytest.raises(RuntimeError, match="DOWNLOAD_BASE_DIR"):
+        JobManager(settings)

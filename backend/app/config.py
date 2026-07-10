@@ -13,6 +13,7 @@ DEFAULT_ALLOWED_DOMAINS = {
     "youtube.com",
     "www.youtube.com",
     "m.youtube.com",
+    "music.youtube.com",
     "youtu.be",
     "tiktok.com",
     "www.tiktok.com",
@@ -80,6 +81,7 @@ class Settings:
     download_base_dir: Path
     port: int
     environment: str
+    ytdlp_socket_timeout_seconds: int = 20
     youtube_cookies_enabled: bool = False
     youtube_cookies_path: Optional[Path] = None
     youtube_cookies_from_browser: str | None = None
@@ -99,7 +101,7 @@ def get_settings() -> Settings:
     is_production = environment.lower() in {"prod", "production"} or bool(os.getenv("RENDER"))
     app_password = os.getenv("APP_PASSWORD")
 
-    if not app_password:
+    if app_password is None or not app_password.strip():
         if is_production:
             raise RuntimeError("APP_PASSWORD es obligatoria en produccion.")
         app_password = "dev-password-change-me"
@@ -107,7 +109,12 @@ def get_settings() -> Settings:
             "APP_PASSWORD no esta configurada. Usando contrasena de desarrollo solo para local."
         )
 
-    token_secret = os.getenv("APP_SECRET_KEY") or app_password
+    configured_secret = os.getenv("APP_SECRET_KEY")
+    token_secret = (
+        configured_secret
+        if configured_secret is not None and configured_secret.strip()
+        else app_password
+    )
 
     return Settings(
         app_password=app_password,
@@ -118,9 +125,12 @@ def get_settings() -> Settings:
         session_ttl_seconds=_parse_int("SESSION_TTL_SECONDS", 24 * 60 * 60),
         allowed_origins=_parse_csv("ALLOWED_ORIGINS"),
         allowed_domains=set(DEFAULT_ALLOWED_DOMAINS),
-        download_base_dir=Path(os.getenv("DOWNLOAD_BASE_DIR", "/tmp/media-downloads")),
+        download_base_dir=(
+            _parse_optional_path("DOWNLOAD_BASE_DIR") or Path("/tmp/media-downloads")
+        ),
         port=_parse_int("PORT", 8000),
         environment=environment,
+        ytdlp_socket_timeout_seconds=_parse_int("YTDLP_SOCKET_TIMEOUT_SECONDS", 20),
         youtube_cookies_enabled=_parse_bool("YOUTUBE_COOKIES_ENABLED", False),
         youtube_cookies_path=_parse_optional_path("YOUTUBE_COOKIES_PATH"),
         youtube_cookies_from_browser=_parse_optional_text("YOUTUBE_COOKIES_FROM_BROWSER"),

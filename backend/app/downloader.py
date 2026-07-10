@@ -11,8 +11,12 @@ from yt_dlp.networking.impersonate import ImpersonateTarget
 from yt_dlp.utils import DownloadError
 
 from .config import Settings
-from .utils import UserFacingError, sanitize_filename
-from .youtube_auth import get_youtube_cookie_options, get_youtube_cookie_status
+from .utils import UserFacingError, safe_remove_tree, sanitize_filename
+from .youtube_auth import (
+    YoutubeCookieFileError,
+    get_youtube_cookie_options,
+    get_youtube_cookie_status,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -22,12 +26,20 @@ PLATFORM_FAILURE_MESSAGE = (
     "No se pudo leer este video. Probablemente hay que actualizar yt-dlp y redeployar."
 )
 PRIVATE_OR_LOGIN_MESSAGE = (
-    "Este video parece requerir acceso especial o login. Esta app solo descarga contenido publico."
+    "Este video requiere acceso o login que yt-dlp no pudo autorizar. "
+    "La app solo descarga contenido permitido y sin DRM."
 )
 NO_FORMATS_MESSAGE = "No se encontraron formatos descargables para este video."
 NETWORK_MESSAGE = "Hubo un problema de red al conectar con la plataforma."
 FFMPEG_MISSING_MESSAGE = "ffmpeg no esta disponible en el servidor. Revisa el Dockerfile o el deploy."
 DRM_MESSAGE = "Este contenido parece protegido con DRM o no descargable por esta app."
+UNAVAILABLE_MESSAGE = (
+    "Este video no está disponible para la app. Puede haber sido eliminado, ser privado "
+    "o estar restringido."
+)
+PLATFORM_IP_BLOCK_MESSAGE = (
+    "La plataforma bloqueó temporalmente la IP del servidor. Probá más tarde o desde otro entorno."
+)
 YOUTUBE_NO_BOT_MESSAGE = (
     "YouTube pidió verificación de cuenta/no-bot. Configurá cookies de YouTube en Render "
     "para descargar este video."
@@ -36,14 +48,29 @@ YOUTUBE_COOKIES_MISSING_MESSAGE = (
     "Las cookies de YouTube están activadas, pero el archivo no existe o no se puede leer."
 )
 YOUTUBE_COOKIES_REJECTED_MESSAGE = "YouTube rechazó estas cookies. Exportá cookies nuevas y redeployá."
+NETWORK_ERROR_TERMS = (
+    "timed out",
+    "timeout",
+    "temporary failure",
+    "connection reset",
+    "connection aborted",
+    "remote end closed connection",
+    "network is unreachable",
+    "name or service not known",
+    "failed to resolve",
+    "could not resolve host",
+    "certificate verify failed",
+    "http error 5",
+)
 
 
 class DownloadCancelled(Exception):
     pass
 
 
-class DownloadTimedOut(Exception):
-    pass
+class DownloadTimedOut(UserFacingError):
+    def __init__(self, message: str = "La operación tardó demasiado y fue cancelada."):
+        super().__init__(message, status_code=504)
 
 
 class DownloadTooLarge(UserFacingError):
@@ -54,15 +81,46 @@ ProgressCallback = Callable[[dict], None]
 CancelCallback = Callable[[], bool]
 
 
+class _SafeYtdlpLogger:
+    """Route yt-dlp output through the application logger after redaction."""
+
+    def debug(self, message: str) -> None:
+        logger.debug("yt-dlp %s", _clean_error(message))
+
+    def info(self, message: str) -> None:
+        logger.info("yt-dlp %s", _clean_error(message))
+
+    def warning(self, message: str) -> None:
+        logger.warning("yt-dlp %s", _clean_error(message))
+
+    def error(self, message: str) -> None:
+        logger.error("yt-dlp %s", _clean_error(message))
+
+
+SAFE_YTDLP_LOGGER = _SafeYtdlpLogger()
+
+
 def fetch_metadata(url: str, settings: Settings) -> dict:
+    deadline = time.monotonic() + settings.download_timeout_seconds
+
+    def guard() -> None:
+        if time.monotonic() >= deadline:
+            raise DownloadTimedOut("La lectura del video tardó demasiado y fue cancelada.")
+
     info = None
     last_error: Exception | None = None
     for attempt in _attempt_profiles(url):
+        guard()
         options = _metadata_options(settings, attempt, url)
         try:
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
-            logger.info("yt-dlp metadata ok attempt=%s url=%s", attempt["debug_code"], url)
+            guard()
+            logger.info(
+                "yt-dlp metadata ok attempt=%s host=%s",
+                attempt["debug_code"],
+                _safe_log_target(url),
+            )
             break
         except DownloadError as exc:
             last_error = exc
@@ -73,6 +131,8 @@ def fetch_metadata(url: str, settings: Settings) -> dict:
             )
             if _is_non_retryable_error(exc):
                 break
+        except DownloadTimedOut:
+            raise
         except Exception as exc:
             last_error = exc
             logger.info(
@@ -80,14 +140,13 @@ def fetch_metadata(url: str, settings: Settings) -> dict:
                 attempt["debug_code"],
                 _clean_error(exc),
             )
+            break
 
     if info is None:
-        raise _map_ytdlp_error(last_error, settings)
+        raise _map_ytdlp_error(last_error, settings, url=url)
 
     _ensure_single_downloadable_item(info)
     _ensure_not_live(info)
-    _ensure_size_allowed(info, settings)
-
     return {
         "title": info.get("title") or "Video sin titulo",
         "site": _site_from_info(info),
@@ -110,7 +169,7 @@ def download_media(
     if quality not in QUALITY_OPTIONS:
         raise UserFacingError("Calidad no valida.")
 
-    started_at = time.monotonic()
+    deadline = time.monotonic() + settings.download_timeout_seconds
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     _emit(
@@ -126,7 +185,7 @@ def download_media(
     def guard() -> None:
         if check_cancelled():
             raise DownloadCancelled()
-        if time.monotonic() - started_at > settings.download_timeout_seconds:
+        if time.monotonic() >= deadline:
             raise DownloadTimedOut()
 
     def progress_hook(data: dict) -> None:
@@ -135,6 +194,11 @@ def download_media(
         if status == "downloading":
             total = data.get("total_bytes") or data.get("total_bytes_estimate")
             downloaded = data.get("downloaded_bytes") or 0
+            if (total and total > settings.max_file_bytes) or downloaded > settings.max_file_bytes:
+                raise DownloadTooLarge(
+                    "El archivo supera el limite configurado.",
+                    status_code=413,
+                )
             download_percent = None
             progress = 18
             if total:
@@ -200,6 +264,7 @@ def download_media(
     code = 1
     last_error: Exception | None = None
     for attempt in _attempt_profiles(url):
+        guard()
         options = _download_options(
             quality,
             temp_dir,
@@ -209,6 +274,7 @@ def download_media(
             attempt,
             url,
         )
+        guard()
         _emit(
             progress_callback,
             status="downloading",
@@ -223,11 +289,18 @@ def download_media(
         try:
             with YoutubeDL(options) as ydl:
                 code = ydl.download([url])
-            logger.info("yt-dlp download ok attempt=%s url=%s", attempt["debug_code"], url)
+            guard()
+            logger.info(
+                "yt-dlp download ok attempt=%s host=%s",
+                attempt["debug_code"],
+                _safe_log_target(url),
+            )
             break
         except DownloadCancelled:
             raise
         except DownloadTimedOut:
+            raise
+        except DownloadTooLarge:
             raise
         except DownloadError as exc:
             last_error = exc
@@ -238,6 +311,7 @@ def download_media(
             )
             if _is_non_retryable_error(exc):
                 break
+            _clear_attempt_artifacts(temp_dir)
             code = 1
         except Exception as exc:
             last_error = exc
@@ -247,10 +321,12 @@ def download_media(
                 _clean_error(exc),
             )
             code = 1
+            break
 
     if code != 0:
-        raise _map_ytdlp_error(last_error, settings)
+        raise _map_ytdlp_error(last_error, settings, url=url)
 
+    guard()
     output_file = _find_output_file(temp_dir)
     if output_file.stat().st_size > settings.max_file_bytes:
         output_file.unlink(missing_ok=True)
@@ -276,7 +352,7 @@ def download_media(
 PHASE_LABELS = {
     "queued": "En cola",
     "validating_url": "Validando link",
-    "normalizing_url": "Limpiando URL",
+    "normalizing_url": "Normalizando URL",
     "extracting_metadata": "Obteniendo metadata",
     "selecting_format": "Seleccionando formato",
     "downloading": "Descargando",
@@ -296,16 +372,18 @@ def _metadata_options(settings: Settings, attempt: dict, url: str | None = None)
     options = {
         "quiet": True,
         "no_warnings": True,
+        "logger": SAFE_YTDLP_LOGGER,
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
-        "socket_timeout": 20,
-        "retries": 2,
-        "fragment_retries": 2,
+        "socket_timeout": settings.ytdlp_socket_timeout_seconds,
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
     }
     options.update(attempt["options"])
     if url and _is_youtube_url(url):
-        options.update(_youtube_cookie_options(settings))
+        _apply_youtube_runtime_options(options, settings)
     return options
 
 
@@ -321,18 +399,21 @@ def _download_options(
     options = {
         "quiet": True,
         "no_warnings": True,
+        "logger": SAFE_YTDLP_LOGGER,
         "noplaylist": True,
         "restrictfilenames": True,
         "windowsfilenames": True,
         "outtmpl": str(temp_dir / "%(title).180B-%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "format": _format_selector(quality),
-        "retries": 4,
-        "fragment_retries": 4,
-        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "file_access_retries": 2,
+        "socket_timeout": settings.ytdlp_socket_timeout_seconds,
         "continuedl": True,
-        "nooverwrites": True,
-        "max_filesize": settings.max_file_bytes,
+        "overwrites": False,
+        "match_filter": _max_size_match_filter(settings),
         "progress_hooks": [progress_hook],
         "postprocessor_hooks": [postprocessor_hook],
         "concurrent_fragment_downloads": 4,
@@ -340,7 +421,7 @@ def _download_options(
     if attempt:
         options.update(attempt["options"])
     if url and _is_youtube_url(url):
-        options.update(_youtube_cookie_options(settings))
+        _apply_youtube_runtime_options(options, settings)
     if quality == "mp3":
         options["postprocessors"] = [
             {
@@ -352,9 +433,20 @@ def _download_options(
     return options
 
 
+def _apply_youtube_runtime_options(options: dict, settings: Settings) -> None:
+    # yt-dlp enables Deno by default, but Node must be explicitly enabled. The
+    # production image provides a supported Node runtime and the `default`
+    # dependency extra provides the matching yt-dlp-ejs package.
+    options["js_runtimes"] = {"node": {"path": None}}
+    options.update(_youtube_cookie_options(settings))
+
+
 def _youtube_cookie_options(settings: Settings) -> dict:
     status = get_youtube_cookie_status(settings)
-    options = get_youtube_cookie_options(settings)
+    try:
+        options = get_youtube_cookie_options(settings)
+    except YoutubeCookieFileError as exc:
+        raise UserFacingError(YOUTUBE_COOKIES_REJECTED_MESSAGE, status_code=403) from exc
     if status["enabled"] and not options:
         logger.warning(
             "youtube cookies enabled but unavailable mode=%s configured=%s readable=%s",
@@ -367,13 +459,18 @@ def _youtube_cookie_options(settings: Settings) -> dict:
 
 def _format_selector(quality: str) -> str:
     if quality == "mp3":
-        return "bestaudio/best"
+        return "bestaudio[ext=m4a]/bestaudio/best"
     if quality == "best":
-        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+        return (
+            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/best[ext=mp4]/best"
+        )
     return (
-        f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={quality}]+bestaudio/"
-        f"best[height<={quality}][ext=mp4]/best[height<={quality}]"
+        f"bestvideo[height<=?{quality}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<=?{quality}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<=?{quality}]+bestaudio/"
+        f"best[height<=?{quality}][ext=mp4]/best[height<=?{quality}]"
     )
 
 
@@ -391,19 +488,29 @@ def _ensure_not_live(info: dict) -> None:
 
 
 def _ensure_size_allowed(info: dict, settings: Settings) -> None:
-    estimated = info.get("filesize") or info.get("filesize_approx")
-    if not estimated:
-        estimates = [
-            fmt.get("filesize") or fmt.get("filesize_approx")
-            for fmt in info.get("formats", [])
-            if fmt.get("filesize") or fmt.get("filesize_approx")
-        ]
-        estimated = max(estimates) if estimates else None
+    selected = info.get("requested_downloads") or info.get("requested_formats") or []
+    selected_sizes = [
+        item.get("filesize") or item.get("filesize_approx")
+        for item in selected
+        if item.get("filesize") or item.get("filesize_approx")
+    ]
+    estimated = sum(selected_sizes) if selected_sizes else (
+        info.get("filesize") or info.get("filesize_approx")
+    )
     if estimated and estimated > settings.max_file_bytes:
         raise DownloadTooLarge(
             "El archivo supera el limite configurado.",
             status_code=413,
         )
+
+
+def _max_size_match_filter(settings: Settings) -> Callable[..., str | None]:
+    def check(info: dict, *, incomplete: bool = False) -> str | None:
+        if not incomplete:
+            _ensure_size_allowed(info, settings)
+        return None
+
+    return check
 
 
 def _site_from_info(info: dict) -> str:
@@ -431,6 +538,12 @@ def _find_output_file(temp_dir: Path) -> Path:
     return max(candidates, key=lambda path: path.stat().st_size)
 
 
+def _clear_attempt_artifacts(temp_dir: Path) -> None:
+    """Prevent a failed fallback from being mistaken for the final output."""
+    for child in temp_dir.iterdir():
+        safe_remove_tree(child)
+
+
 def _rename_for_delivery(path: Path) -> Path:
     safe_stem = sanitize_filename(path.stem)
     suffix = path.suffix.lower() or ".mp4"
@@ -446,7 +559,46 @@ def _rename_for_delivery(path: Path) -> Path:
 
 
 def _clean_error(exc: Exception) -> str:
-    return str(exc).replace("\n", " ")[:500]
+    message = str(exc).replace("\n", " ")
+    message = re.sub(
+        r"(\[[A-Za-z0-9:_ -]+\]\s+)[^:\s]+(?=:)",
+        r"\1<media-id>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)(['\"]?(?:authorization|proxy-authorization|cookie|set-cookie)['\"]?\s*:\s*)"
+        r"(['\"])[^'\"]*\2",
+        r"\1<credential redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:authorization|proxy-authorization|cookie|set-cookie)\b\s*[:=]\s*.*$",
+        "<credential redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?:https?|ftp|file)://[^\s]+",
+        lambda match: f"<url host={_safe_log_target(match.group(0))}>",
+        message,
+        flags=re.IGNORECASE,
+    )
+    message = re.sub(r"(?i)(?:data|javascript):[^\s]+", "<url redacted>", message)
+    message = re.sub(
+        r"(?<![\w:])/(?:[^/\s\"']+/)*[^/\s\"']+",
+        "<path>",
+        message,
+    )
+    message = re.sub(r"[A-Za-z]:\\[^\s]+", "<path>", message)
+    message = re.sub(r"(?i)cookies?file\s*[:=]\s*\S+", "<cookie path redacted>", message)
+    message = re.sub(r"(?i)\S*cookies?\S*\.txt", "<cookie path redacted>", message)
+    return message[:500]
+
+
+def _safe_log_target(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "unknown").lower().rstrip(".")
+    except (TypeError, ValueError):
+        return "unknown"
 
 
 def _attempt_profiles(url: str) -> list[dict]:
@@ -462,33 +614,27 @@ def _attempt_profiles(url: str) -> list[dict]:
                         }
                     },
                 },
-                {
-                    "debug_code": "youtube_alt_clients_mweb_web",
-                    "options": {
-                        "extractor_args": {"youtube": {"player_client": ["mweb", "web"]}}
-                    },
-                },
-                {
-                    "debug_code": "youtube_alt_clients_tv_web",
-                    "options": {
-                        "extractor_args": {"youtube": {"player_client": ["tv", "web"]}}
-                    },
-                },
             ]
         )
-        if importlib.util.find_spec("curl_cffi"):
-            profiles.append(
-                {
-                    "debug_code": "impersonate_chrome",
-                    "options": {"impersonate": ImpersonateTarget.from_str("chrome")},
-                }
-            )
+    if importlib.util.find_spec("curl_cffi"):
+        profiles.append(
+            {
+                "debug_code": "impersonate_chrome",
+                "options": {"impersonate": ImpersonateTarget.from_str("chrome")},
+            }
+        )
     return profiles
 
 
 def _is_youtube_url(url: str) -> bool:
     hostname = (urlparse(url).hostname or "").lower()
-    return hostname in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+    return hostname in {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+    }
 
 
 def _emit(progress_callback: ProgressCallback, **event) -> None:
@@ -553,7 +699,12 @@ def _current_filename(data: dict) -> str | None:
     return Path(filename).name if filename else None
 
 
-def _map_ytdlp_error(exc: Exception | None, settings: Settings | None = None) -> UserFacingError:
+def _map_ytdlp_error(
+    exc: Exception | None,
+    settings: Settings | None = None,
+    *,
+    url: str | None = None,
+) -> UserFacingError:
     if exc is None:
         return UserFacingError(PLATFORM_FAILURE_MESSAGE)
     message = str(exc)
@@ -562,7 +713,38 @@ def _map_ytdlp_error(exc: Exception | None, settings: Settings | None = None) ->
         return UserFacingError(FFMPEG_MISSING_MESSAGE, status_code=500)
     if "drm" in lowered:
         return UserFacingError(DRM_MESSAGE, status_code=403)
-    if _is_youtube_no_bot_error(lowered):
+    if any(
+        term in lowered
+        for term in (
+            "ip address is blocked",
+            "blocked your ip",
+            "this ip has been blocked",
+            "access denied for this ip",
+        )
+    ):
+        return UserFacingError(PLATFORM_IP_BLOCK_MESSAGE, status_code=503)
+    if any(
+        term in lowered
+        for term in (
+            "video unavailable",
+            "content unavailable",
+            "post not found",
+            "video has been removed",
+            "this tweet is unavailable",
+        )
+    ):
+        return UserFacingError(UNAVAILABLE_MESSAGE, status_code=404)
+    is_youtube = bool(url and _is_youtube_url(url))
+    if _is_youtube_cookie_rejection(lowered) and (is_youtube or url is None):
+        if settings:
+            status = get_youtube_cookie_status(settings)
+            if status["enabled"] and not (status["configured"] and status["readable"]):
+                return UserFacingError(YOUTUBE_COOKIES_MISSING_MESSAGE, status_code=500)
+        return UserFacingError(YOUTUBE_COOKIES_REJECTED_MESSAGE, status_code=403)
+    if is_youtube and (
+        _is_youtube_no_bot_error(lowered)
+        or any(term in lowered for term in ("http error 429", "too many requests"))
+    ):
         if settings:
             status = get_youtube_cookie_status(settings)
             if status["enabled"] and not (status["configured"] and status["readable"]):
@@ -582,21 +764,7 @@ def _map_ytdlp_error(exc: Exception | None, settings: Settings | None = None) ->
         )
     ):
         return UserFacingError(NO_FORMATS_MESSAGE)
-    if any(
-        term in lowered
-        for term in (
-            "timed out",
-            "timeout",
-            "temporary failure",
-            "connection reset",
-            "connection aborted",
-            "network is unreachable",
-            "name or service not known",
-            "failed to resolve",
-            "could not resolve host",
-            "http error 5",
-        )
-    ):
+    if _is_network_error(lowered):
         return UserFacingError(NETWORK_MESSAGE, status_code=503)
     return UserFacingError(PLATFORM_FAILURE_MESSAGE)
 
@@ -604,16 +772,50 @@ def _map_ytdlp_error(exc: Exception | None, settings: Settings | None = None) ->
 def _is_youtube_no_bot_error(lowered: str) -> bool:
     return (
         "not a bot" in lowered
+        or "confirm you are not a bot" in lowered
         or "use --cookies-from-browser" in lowered
         or "use --cookies" in lowered
     )
 
 
+def _is_youtube_cookie_rejection(lowered: str) -> bool:
+    return any(
+        term in lowered
+        for term in (
+            "account cookies are no longer valid",
+            "cookies are no longer valid",
+            "cookies have expired",
+            "expired cookies",
+            "invalid cookies",
+            "invalid netscape format cookies",
+            "does not look like a netscape format cookies",
+            "could not open cookie file",
+            "unable to open cookie file",
+            "failed to load cookies",
+            "error loading cookies",
+            "failed to parse cookies",
+        )
+    )
+
+
 def _is_non_retryable_error(exc: Exception) -> bool:
     lowered = str(exc).lower()
+    if _is_youtube_cookie_rejection(lowered):
+        return True
+    if _is_youtube_no_bot_error(lowered):
+        return False
     return (
         ("ffmpeg" in lowered and "not installed" in lowered)
         or "private" in lowered
         or "sign in" in lowered
+        or "cookies" in lowered
         or "drm" in lowered
+        or "unsupported url" in lowered
+        or "not available in your country" in lowered
+        or "video unavailable" in lowered
+        or _is_network_error(lowered)
     )
+
+
+def _is_network_error(lowered: str) -> bool:
+    return any(term in lowered for term in NETWORK_ERROR_TERMS)

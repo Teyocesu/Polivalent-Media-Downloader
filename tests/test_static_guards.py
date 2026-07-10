@@ -11,14 +11,23 @@ def test_no_unsafe_shell_or_database_code():
         text = path.read_text()
         scanned.append(path)
         assert "shell=True" not in text
-        assert "subprocess" not in text
         assert "os.system" not in text
-        if path.name != "youtube_auth.py":
+        if path.name not in {"youtube_auth.py", "downloader.py"}:
             assert "cookiefile" not in text.lower()
             assert "cookiesfrombrowser" not in text.lower()
         assert "sqlite" not in text.lower()
         assert "sqlalchemy" not in text.lower()
     assert scanned
+
+
+def test_node_version_probe_uses_fixed_argv_without_shell():
+    text = (ROOT / "backend/app/main.py").read_text()
+    assert "subprocess.run(" in text
+    assert '[executable, "--version"]' in text
+    assert "check=False" in text
+    assert "stderr=subprocess.DEVNULL" in text
+    assert "timeout=2" in text
+    assert "shell=" not in text
 
 
 def test_gitignore_covers_sensitive_and_generated_paths():
@@ -69,11 +78,17 @@ def test_no_cookie_files_are_tracked():
 
 def test_dockerfile_supports_render_single_service_build():
     text = (ROOT / "Dockerfile").read_text()
+    assert "FROM node:24-bookworm-slim" in text
     assert "ffmpeg" in text
-    assert "nodejs" in text
+    assert "COPY --from=frontend-build /usr/local/bin/node /usr/local/bin/node" in text
+    assert "apt-get install -y --no-install-recommends ffmpeg ca-certificates nodejs" not in text
+    assert "USER app" in text
     assert "npm ci" in text
     assert "npm run build" in text
-    assert "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}" in text
+    assert "pip==26.1.2" in text
+    assert "--force-reinstall" in text
+    assert "python -m pip check" in text
+    assert "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}" in text
 
 
 def test_manifest_is_pwa_ready():

@@ -16,4 +16,5 @@ youtube-cookies.txt
 *cookies*.txt
 .pytest_cache
 .playwright-cli
+output/playwright
 .DS_Store
